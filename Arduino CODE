@@ -1,0 +1,3119 @@
+#include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <Wire.h>
+#include <Adafruit_INA3221.h>
+#include <math.h>
+#include <Preferences.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h>
+#include <esp_arduino_version.h>
+
+struct SolarPos  { float altitude; float azimuth; };
+struct IrradComp { float DNI; float DHI; };
+
+const int SOLAR_SLOT_START_HOUR = 6;
+const int SOLAR_SLOT_END_HOUR   = 18;
+const int SOLAR_SLOT_COUNT      = SOLAR_SLOT_END_HOUR - SOLAR_SLOT_START_HOUR + 1;
+
+struct DayForecastData {
+  int   skySlots[SOLAR_SLOT_COUNT];
+  int   popSlots[SOLAR_SLOT_COUNT];
+  int   rehSlots[SOLAR_SLOT_COUNT];
+  float tempSlots[SOLAR_SLOT_COUNT];
+  bool  slotValid[SOLAR_SLOT_COUNT];
+  int   slotCount;
+};
+
+// ================= USER SETTING =================
+const char* WIFI_SSID = "*****"; //wifi ID
+const char* WIFI_PASS = "*****"; //wifi PASSWORD
+String KMA_KEY = "000000000000000"; //기상청 api KEY
+int NX = 00, NY = 00; //기상청 현재위치
+
+const float LATITUDE_DEG               = 0.0000f; //위도
+const float LONGITUDE_DEG              = 0.0000f; //경도
+const float PANEL_TILT_DEG             = 30.0f;
+const float PANEL_AZIMUTH_DEG          = 180.0f;  // 정남향: 북=0, 동=90, 남=180, 서=270 기준
+const float PANEL_PEAK_W               = 5.0f;
+const int   PANEL_COUNT                = 2;
+const float NOCT                       = 45.0f;
+const float TEMP_COEFF_PER_C           = -0.004f;
+const float SHADOW_ALTITUDE_THRESH_DEG = 15.0f;
+const float SYSTEM_EFFICIENCY          = 0.80f;
+
+// ================= PIN =================
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define TOUCH_CS 15
+#define SPI_SCK  18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+#define I2C_SDA  21
+#define I2C_SCL  22
+#define LED_LOAD_PIN    14
+#define MOTOR_RELAY_PIN 33
+#define MOTOR_RELAY_ACTIVE_LOW true
+#define MOTOR_RELAY_ON  (MOTOR_RELAY_ACTIVE_LOW ? HIGH : LOW)
+#define MOTOR_RELAY_OFF (MOTOR_RELAY_ACTIVE_LOW ? LOW  : HIGH)
+
+#define TRAFFIC_LED_R_PIN 25
+#define TRAFFIC_LED_Y_PIN 26
+#define TRAFFIC_LED_G_PIN 27
+#define POWER_RELAY_PIN   32
+#define POWER_RELAY_ACTIVE_LOW false
+#define POWER_RELAY_EXTERNAL_ON (POWER_RELAY_ACTIVE_LOW ? LOW  : HIGH)
+#define POWER_RELAY_BATTERY_ON  (POWER_RELAY_ACTIVE_LOW ? HIGH : LOW)
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TOUCH_CS);
+Adafruit_INA3221 ina3221;
+Preferences prefs;
+WebServer server(80);
+bool webServerReady = false;
+String eventLogs[5];
+int eventLogCount = 0;
+String getTimeOnlyString();
+void addEventLog(String msg){
+  String tm = getTimeOnlyString();
+  String full = tm + "|" + msg;
+
+  if(eventLogCount < 5){
+    eventLogs[eventLogCount++] = full;
+  }else{
+    for(int i=0;i<4;i++) eventLogs[i] = eventLogs[i+1];
+    eventLogs[4] = full;
+  }
+
+  Serial.println("[EVENT] " + full);
+}
+bool ina3221OK = false;
+const float INA3221_SHUNT_OHMS = 0.10f;  // INA3221 모듈 R100 샌트저항 = 0.10Ω
+
+// ================= HW TIMER (API LED 점멸 전용) =================
+hw_timer_t* apiLedHwTimer = NULL;
+portMUX_TYPE apiLedTimerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool apiLedHwBlink = false;
+volatile bool apiLedHwActive = false;
+
+void IRAM_ATTR onApiLedTimer(){
+  portENTER_CRITICAL_ISR(&apiLedTimerMux);
+  if(apiLedHwActive){
+    apiLedHwBlink = !apiLedHwBlink;
+    digitalWrite(TRAFFIC_LED_R_PIN, apiLedHwBlink ? HIGH : LOW);
+    digitalWrite(TRAFFIC_LED_Y_PIN, apiLedHwBlink ? HIGH : LOW);
+    digitalWrite(TRAFFIC_LED_G_PIN, apiLedHwBlink ? HIGH : LOW);
+  }
+  portEXIT_CRITICAL_ISR(&apiLedTimerMux);
+}
+
+void startApiLedHwTimer(){
+  apiLedHwActive = true;
+  apiLedHwBlink  = false;
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  if(apiLedHwTimer == NULL){
+    apiLedHwTimer = timerBegin(1000000);              
+    timerAttachInterrupt(apiLedHwTimer, &onApiLedTimer);
+  }
+  timerAlarm(apiLedHwTimer, 300000, true, 0);          
+#else
+  if(apiLedHwTimer == NULL){
+    apiLedHwTimer = timerBegin(0, 80, true);           
+    timerAttachInterrupt(apiLedHwTimer, &onApiLedTimer, true);
+    timerAlarmWrite(apiLedHwTimer, 300000, true);      
+  }
+  timerAlarmEnable(apiLedHwTimer);
+#endif
+}
+
+void stopApiLedHwTimer(){
+  apiLedHwActive = false;
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+  if(apiLedHwTimer != NULL) timerAlarmDisable(apiLedHwTimer);
+#endif
+}
+
+// ================= COLOR =================
+#define C_BG     ILI9341_BLACK
+#define C_CARD   0x0841
+#define C_LINE   0x39E7
+#define C_WHITE  ILI9341_WHITE
+#define C_YELLOW ILI9341_YELLOW
+#define C_GREEN  ILI9341_GREEN
+#define C_CYAN   ILI9341_CYAN
+#define C_RED    ILI9341_RED
+#define C_GRAY   0x8410
+
+// ================= PAGE =================
+#define PAGE_SYSTEM   0
+#define PAGE_LOAD     1
+#define PAGE_MAIN     2
+#define PAGE_COMPARE  3
+#define PAGE_FORECAST 4
+#define PAGE_MIN PAGE_SYSTEM
+#define PAGE_MAX PAGE_FORECAST
+
+int  currentPage = PAGE_SYSTEM;
+bool touching    = false;
+int  startX = 0, startY = 0;
+
+// ================= DATA =================
+float solarPower=0, solarVoltage=0, solarCurrent=0;
+float loadVoltage=0, loadCurrent=0;
+float batteryVoltage=0, batteryCurrent=0;
+int   batteryPercent=0;
+
+// --- [수정됨] 쿨롱 카운팅 및 초기화 관련 추가 변수 ---
+const float BATTERY_INTERNAL_R_OHM = 0.12f;
+const float BATTERY_CURRENT_SIGN   = 1.0f;
+const float BATTERY_CAPACITY_AH = 3.0f; // 18650 배터리 용량 (예: 2600mAh -> 2.6A). 실제 용량에 맞게 수정하세요.
+const float UNMEASURED_BASE_CURRENT_A = 0.0f; // CH2가 배터리 전체 전류를 측정하므로 추가 기저부하 보정 없음
+
+float currentCapacityAh = 0.0f;
+bool isCoulombInitialized = false;
+unsigned long bootTimeMs = 0;
+float initVoltageSum = 0;
+float initCurrentSum = 0;
+int initSampleCount = 0;
+unsigned long lastCoulombUpdate = 0;
+// 순간적인 모터 기동/부하 투입 전압 강하로 SOC가 0%로 리셋되는 것을 방지하기 위한 저전압 지속시간 확인
+unsigned long batteryLowVoltageStartMs = 0;
+// ----------------------------------------------------
+
+float  loadPower=0;
+String essMode="NORMAL";
+
+float todayGenWh=0, tomorrowGenWh=0, afterTomorrowGenWh=0;
+float todayHourlyGenWh[SOLAR_SLOT_COUNT]={0};
+float tomorrowHourlyGenWh[SOLAR_SLOT_COUNT]={0};
+float afterTomorrowHourlyGenWh[SOLAR_SLOT_COUNT]={0};
+
+float    actualHourlyWh[SOLAR_SLOT_COUNT]={0};
+float    currentSlotAccumWh=0;
+float    minuteSolarSum=0;
+uint16_t minuteSolarCount=0;
+float    currentMinuteAvgW=0;
+uint8_t  lastMinuteRecorded=255;
+int      lastHourCompleted=-1;
+bool     actualDataLoaded=false;
+
+int  ecoModeThresholdPercent=30;
+const int CRITICAL_BATTERY_EXTERNAL_PERCENT=10;
+
+// ================= ECO EXTERNAL TRANSFER DELAY =================
+// AUTO에서 ESS Mode가 ECO로 결정되더라도 즉시 외부전원으로 전환하지 않고,
+// 5초 동안 내부 배터리를 유지하여 5V 버스 커패시터/전원 안정 시간을 확보한다.
+const unsigned long ECO_EXTERNAL_TRANSFER_DELAY_MS = 5000UL;
+bool ecoExternalDelayActive = false;
+unsigned long ecoExternalDelayStartMs = 0;
+
+// 수동 외부전원 전환도 릴레이 순간 전환으로 인한 전원 불안정을 줄이기 위해
+// 5초 동안 내부 배터리를 유지한 뒤 외부전원으로 전환한다.
+bool manualExternalDelayActive = false;
+unsigned long manualExternalDelayStartMs = 0;
+
+String wifiStatus="---";
+String lastApiSync="--:--";
+String apiStatus="API: WAIT";
+bool   initialKmaFetched=false;
+bool   initialApiTaskStarted=false;
+volatile bool initialApiTaskRunning=false;
+bool   wifiDisconnectedAlert=false;
+bool   lastWifiConnectedState=false;
+
+enum TrafficLedMode {
+  LED_MODE_OFF, LED_MODE_WIFI_CONNECTING, LED_MODE_WIFI_CONNECTED,
+  LED_MODE_WIFI_FAILED, LED_MODE_TIME_SYNC, LED_MODE_API_LOADING, LED_MODE_API_FAILED,
+  LED_MODE_ESS_ECO, LED_MODE_ESS_NORMAL
+};
+TrafficLedMode trafficLedMode=LED_MODE_OFF;
+unsigned long trafficLedLastToggle=0;
+bool trafficLedBlinkState=false;
+
+bool allLoadOn=false, motorLoadOn=false, ledLoadOn=false;
+
+// ================= POWER SOURCE MODE =================
+enum PowerSourceMode {
+  POWER_SOURCE_AUTO,
+  POWER_SOURCE_FORCE_EXTERNAL,
+  POWER_SOURCE_FORCE_BATTERY
+};
+PowerSourceMode powerSourceMode = POWER_SOURCE_AUTO;
+
+const char* powerSourceModeText(){
+  switch(powerSourceMode){
+    case POWER_SOURCE_FORCE_EXTERNAL: return "FORCE EXT";
+    case POWER_SOURCE_FORCE_BATTERY:  return "FORCE BAT";
+    default:                          return "AUTO";
+  }
+}
+const char* activePowerSourceText(){
+  int v = digitalRead(POWER_RELAY_PIN);
+  if(v == POWER_RELAY_EXTERNAL_ON) return "EXTERNAL";
+  return "BATTERY";
+}
+
+// ================= 전방 선언 =================
+String getTimeOnlyString();
+void applyLoadOutputs();
+void drawLoadControlPage();
+void updateEssModeByBatteryAndForecast();
+void fetchKmaForecast();
+bool fetchKmaForecastByBase(const String&, const String&, DayForecastData[3]);
+const char* genLevelText(float wh);
+void updateEssModeByTomorrowForecast();
+void applyEssModeOutputs();
+bool isEcoModeActive();
+bool shouldForceMotorOff();
+void updateTrafficLedBlink();
+void cancelEcoExternalDelay();
+void startEcoExternalDelay();
+void updateEcoExternalDelay();
+void cancelManualExternalDelay();
+void startManualExternalDelay();
+void updateManualExternalDelay();
+bool isApiForecastOk();
+void drawBatteryIcon(int, int, int);
+void parseKmaItemsAdvancedAppend(const String&, String[3], DayForecastData[3]);
+int  extractJsonIntValue(const String&, const char*);
+void drawComparePage();
+void updateActualSolarData();
+void saveActualDataToNVS();
+void loadActualDataFromNVS();
+void updateMainDynamicValues();
+String getDateStringOffset(int);
+String getTimeOnlyString();
+bool waitForTimeSync(unsigned long timeoutMs=15000);
+void drawSystemPage();
+void updateSystemPageTimeOnly();
+void drawMainPage();
+void connectWiFi();
+void doApiSyncAfterWifi();
+bool ensureTimeSyncedForApi(unsigned long timeoutMs=45000);
+bool fetchKmaForecastWithRetry(uint8_t tries, unsigned long retryDelayMs);
+void forceBatteryPowerMode();
+bool pointInRect(int x,int y,int rx,int ry,int rw,int rh);
+void setTrafficLeds(bool r,bool y,bool g);
+void monitorWiFiConnection();
+void setupWebServer();
+void doWifiReconnect();
+void doApiRefresh();
+void handleWebRoot();
+void handleWebInaJson();
+void handleWebSetEco();
+void loadEcoThresholdFromNVS();
+void saveEcoThresholdToNVS();
+void handleWebSetSource();
+void handleWebSetLoad();
+void handleWebWifiReconnect();
+void handleWebApiRefresh();
+void handleWebNotFound();
+
+// ================= INA3221 =================
+void initINA3221(){
+  Wire.begin(I2C_SDA,I2C_SCL);
+  if(!ina3221.begin(0x40,&Wire)){Serial.println("INA3221 not found!");ina3221OK=false;return;}
+  Serial.println("INA3221 found!"); ina3221OK=true;
+  ina3221.setAveragingMode(INA3221_AVG_16_SAMPLES);
+  for(uint8_t i=0;i<3;i++) ina3221.setShuntResistance(i,INA3221_SHUNT_OHMS);
+}
+void updateSolarPowerFromINA3221(){
+  if(!ina3221OK){solarPower=0;return;}
+  solarVoltage=ina3221.getBusVoltage(0);
+  solarCurrent=ina3221.getCurrentAmps(0);
+  solarPower=solarVoltage*fabs(solarCurrent);
+  if(solarPower<0.05f)solarPower=0;
+}
+void updateLoadPowerFromINA3221(){
+  if(!ina3221OK){loadPower=loadVoltage=loadCurrent=0;return;}
+  loadVoltage=ina3221.getBusVoltage(2);
+  loadCurrent=ina3221.getCurrentAmps(2);
+  loadPower=loadVoltage*fabs(loadCurrent);
+  if(loadPower<0.05f)loadPower=0;
+}
+float voltageToBatterySOC(float v){
+  const float vt[]={3.00,3.20,3.30,3.50,3.60,3.70,3.75,3.80,3.85,3.90,4.00,4.10,4.20};
+  const float st[]={0,5,10,20,30,40,50,60,70,80,90,95,100};
+  const int n=13;
+  if(v<=vt[0])return 0; if(v>=vt[n-1])return 100;
+  for(int i=0;i<n-1;i++)
+    if(v>=vt[i]&&v<vt[i+1])return st[i]+(v-vt[i])/(vt[i+1]-vt[i])*(st[i+1]-st[i]);
+  return 0;
+}
+float getBatteryCorrectedVoltage(float rv,float rc){return rv+rc*BATTERY_CURRENT_SIGN*BATTERY_INTERNAL_R_OHM;}
+
+// --- [수정됨] 쿨롱 카운팅 및 하이브리드 초기화 로직 ---
+void updateBatteryFromINA3221(){
+  if(!ina3221OK){batteryVoltage=batteryCurrent=batteryPercent=0;return;}
+
+  unsigned long now = millis();
+  float rv = ina3221.getBusVoltage(1);  
+  float rc = ina3221.getCurrentAmps(1); 
+
+  batteryVoltage = rv;
+  batteryCurrent = rc;
+
+  // 1. OCV 측정 지연 및 하이브리드 초기화 (부팅 후 5초 대기)
+  if (!isCoulombInitialized) {
+    if (bootTimeMs == 0) bootTimeMs = now;
+    
+    // 5초(5000ms) 동안 데이터 평균 수집으로 튀는 Inrush 전류/전압 필터링
+    if (now - bootTimeMs < 5000) {
+      initVoltageSum += rv;
+      initCurrentSum += rc;
+      initSampleCount++;
+      return; 
+    }
+
+    // 5초 경과 후 실행
+    float avgV = initVoltageSum / initSampleCount;
+    float avgC = initCurrentSum / initSampleCount;
+    
+    // 현재 전압 기반 잔량 추정 (OCV)
+    float estimatedSocPercent = voltageToBatterySOC(getBatteryCorrectedVoltage(avgV, avgC));
+    float estimatedAh = BATTERY_CAPACITY_AH * (estimatedSocPercent / 100.0f);
+
+    // NVS(플래시 메모리)에서 마지막으로 저장된 잔량 불러오기
+    prefs.begin("bms", true); 
+    float savedAh = prefs.getFloat("socAh", -1.0f);
+    prefs.end();
+
+    // 스마트 비교: 오차 허용 범위 15%
+    float capacityTolerance = BATTERY_CAPACITY_AH * 0.15f; 
+
+    if (savedAh >= 0.0f) {
+      // 꺼져있는 동안 충방전 변화가 크게 일어났다면 현재 전압 추정값(OCV) 채택
+      if (abs(estimatedAh - savedAh) > capacityTolerance) {
+        Serial.println("[BMS] Change detected. Using OCV estimation.");
+        currentCapacityAh = estimatedAh;
+      } else {
+        // 출렁임 범위 내라면 안정적인 이전 저장값(NVS) 복원
+        Serial.println("[BMS] Restoring saved NVS state.");
+        currentCapacityAh = savedAh;
+      }
+    } else {
+      // 최초 구동 또는 NVS 데이터 없음
+      Serial.println("[BMS] First boot or no memory. Using OCV estimation.");
+      currentCapacityAh = estimatedAh;
+    }
+
+    lastCoulombUpdate = now;
+    isCoulombInitialized = true;
+    
+    // 첫 퍼센트 갱신 및 UI/Blynk 반영
+    batteryPercent = constrain((int)round((currentCapacityAh / BATTERY_CAPACITY_AH) * 100.0f), 0, 100);
+    updateEssModeByBatteryAndForecast();
+return;
+  }
+
+  // 2. 쿨롱 카운팅 (전류 누적 적산)
+  float dtHours = (now - lastCoulombUpdate) / 3600000.0f; 
+  lastCoulombUpdate = now;
+
+  float effectiveCurrent = rc; 
+  
+  // 측정되지 않는 ESP32 및 릴레이 기저 부하 강제 보정
+  if (effectiveCurrent < 0) effectiveCurrent -= UNMEASURED_BASE_CURRENT_A; 
+  else if (effectiveCurrent > 0) effectiveCurrent -= UNMEASURED_BASE_CURRENT_A;
+  else effectiveCurrent = -UNMEASURED_BASE_CURRENT_A;
+
+  currentCapacityAh += (effectiveCurrent * dtHours);
+
+  // 3. 상/하한 제한 및 Drift 자동 보정
+  if (currentCapacityAh > BATTERY_CAPACITY_AH) currentCapacityAh = BATTERY_CAPACITY_AH;
+  if (currentCapacityAh < 0.0f) currentCapacityAh = 0.0f;
+  
+  // 완충(4.15V 이상) 또는 완전방전(3.0V 이하) 조건 도달 시 잔량 리셋(Drift Calibration)
+  if (rv >= 4.15f && effectiveCurrent > -0.1f && effectiveCurrent < 0.1f) {
+    currentCapacityAh = BATTERY_CAPACITY_AH;
+    batteryLowVoltageStartMs = 0;
+  } else if (rv <= 3.0f) {
+    // 모터/LED를 켜는 순간 배터리 전압이 일시적으로 3.0V 이하로 튀면
+    // SOC가 0%로 저장되고 곧바로 ECO->외부전원으로 넘어가는 문제가 생길 수 있으므로
+    // 8초 이상 지속될 때만 완전방전으로 판단한다.
+    if (batteryLowVoltageStartMs == 0) batteryLowVoltageStartMs = now;
+    if (now - batteryLowVoltageStartMs >= 8000UL) currentCapacityAh = 0.0f;
+  } else {
+    batteryLowVoltageStartMs = 0;
+  }
+
+  int newPercent = constrain((int)round((currentCapacityAh / BATTERY_CAPACITY_AH) * 100.0f), 0, 100);
+  
+  // 퍼센트가 변할 때만 플래시 메모리 저장 및 시스템 업데이트 (플래시 수명 보호)
+  if (newPercent != batteryPercent) {
+    batteryPercent = newPercent;
+    
+    prefs.begin("bms", false); 
+    prefs.putFloat("socAh", currentCapacityAh);
+    prefs.end();
+
+    updateEssModeByBatteryAndForecast();
+}
+}
+
+// ================= NVS =================
+void saveActualDataToNVS(){
+  prefs.begin("solact",false);
+  prefs.putString("date",getDateStringOffset(0));
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){char k[5];sprintf(k,"h%d",i);prefs.putFloat(k,actualHourlyWh[i]);}
+  prefs.putFloat("cur",currentSlotAccumWh);
+  prefs.putInt("curh",lastHourCompleted);
+  prefs.end();
+}
+void loadActualDataFromNVS(){
+  prefs.begin("solact",true);
+  String saved=prefs.getString("date",""),today=getDateStringOffset(0);
+  if(saved==today){
+    for(int i=0;i<SOLAR_SLOT_COUNT;i++){char k[5];sprintf(k,"h%d",i);actualHourlyWh[i]=prefs.getFloat(k,0);}
+    currentSlotAccumWh=prefs.getFloat("cur",0);
+    lastHourCompleted=prefs.getInt("curh",-1);
+    Serial.printf("[NVS] loaded curSlot=%.3fWh h=%d\n",currentSlotAccumWh,lastHourCompleted);
+  }else{
+    for(int i=0;i<SOLAR_SLOT_COUNT;i++)actualHourlyWh[i]=0;
+    currentSlotAccumWh=0; lastHourCompleted=-1;
+    Serial.println("[NVS] date mismatch, cleared");
+  }
+  prefs.end(); actualDataLoaded=true;
+}
+
+void loadEcoThresholdFromNVS(){
+  prefs.begin("settings", true);
+  int saved = prefs.getInt("ecoTh", ecoModeThresholdPercent);
+  prefs.end();
+
+  ecoModeThresholdPercent = constrain(saved, 5, 95);
+  Serial.printf("[NVS] ECO threshold loaded: %d%%\n", ecoModeThresholdPercent);
+}
+
+void saveEcoThresholdToNVS(){
+  prefs.begin("settings", false);
+  prefs.putInt("ecoTh", ecoModeThresholdPercent);
+  prefs.end();
+
+  Serial.printf("[NVS] ECO threshold saved: %d%%\n", ecoModeThresholdPercent);
+}
+
+// ================= 실측 누적 =================
+void updateActualSolarData(){
+  if(!initialKmaFetched)return;
+  if(!actualDataLoaded)loadActualDataFromNVS();
+  struct tm ti; if(!getLocalTime(&ti))return;
+  int nh=ti.tm_hour, nm=ti.tm_min;
+  if(nh<SOLAR_SLOT_START_HOUR||nh>SOLAR_SLOT_END_HOUR)return;
+  minuteSolarSum+=solarPower; minuteSolarCount++;
+  if((uint8_t)nm!=lastMinuteRecorded){
+    if(minuteSolarCount>0){
+      float avgW=minuteSolarSum/minuteSolarCount, whMin=avgW/60.0f;
+      currentMinuteAvgW=avgW;
+      int si=nh-SOLAR_SLOT_START_HOUR;
+      if(si>=0&&si<SOLAR_SLOT_COUNT) currentSlotAccumWh+=whMin;
+    }
+    minuteSolarSum=0; minuteSolarCount=0; lastMinuteRecorded=(uint8_t)nm;
+    saveActualDataToNVS();
+if(currentPage==PAGE_COMPARE) drawComparePage();
+    if(currentPage==PAGE_MAIN)    updateMainDynamicValues();
+  }
+  if(nh!=lastHourCompleted&&lastHourCompleted>=SOLAR_SLOT_START_HOUR&&lastHourCompleted<=SOLAR_SLOT_END_HOUR){
+    int ps=lastHourCompleted-SOLAR_SLOT_START_HOUR;
+    if(ps>=0&&ps<SOLAR_SLOT_COUNT){
+      actualHourlyWh[ps]=currentSlotAccumWh;
+      Serial.printf("[Actual] H%d=%.3fWh complete\n",lastHourCompleted,actualHourlyWh[ps]);
+    }
+    currentSlotAccumWh=0; saveActualDataToNVS();
+}
+  lastHourCompleted=nh;
+}
+
+// ================= TIME =================
+String getDateTimeString(){
+  struct tm ti; if(!getLocalTime(&ti))return "TIME FAIL";
+  char b[20]; strftime(b,sizeof(b),"%m/%d %H:%M",&ti); return String(b);
+}
+String getTimeOnlyString(){
+  struct tm ti; if(!getLocalTime(&ti))return "--:--";
+  char b[6]; strftime(b,sizeof(b),"%H:%M",&ti); return String(b);
+}
+String getDateStringOffset(int od){
+  time_t n; time(&n); n+=od*86400;
+  struct tm*t=localtime(&n); char b[9]; strftime(b,sizeof(b),"%Y%m%d",t); return String(b);
+}
+bool waitForTimeSync(unsigned long tms){
+  unsigned long s=millis(); struct tm ti;
+  while(millis()-s<tms){
+    if(getLocalTime(&ti)&&ti.tm_year+1900>=2024)return true;
+    // 시간 동기화 대기 중에도 LED 점멸이 멈추지 않도록 짧은 주기로 갱신
+    updateTrafficLedBlink();
+    delay(80);
+  }
+  return false;
+}
+
+// ================= KMA BASE =================
+String getBaseDateForHour(int bh){
+  time_t n; time(&n); struct tm*t=localtime(&n);
+  if(t->tm_hour<bh){n-=24*3600;t=localtime(&n);}
+  char db[9]; strftime(db,sizeof(db),"%Y%m%d",t); return String(db);
+}
+String twoDigitBaseTime(int bh){char tb[5];sprintf(tb,"%02d00",bh);return String(tb);}
+int getLatestKmaBaseHour(){
+  struct tm ti; if(!getLocalTime(&ti))return 5;
+  int h=ti.tm_hour,m=ti.tm_min;
+  // KMA 초단기/단기예보 데이터는 발표시각 직후 바로 안정적으로 조회되지 않는 경우가 있어
+  // 부팅 직후 자동 호출 실패를 줄이기 위해 25분 전까지는 이전 발표시각을 사용한다.
+  if(m<25)h--;
+  if(h<0)h=23;
+  if(h>=23)return 23; if(h>=20)return 20; if(h>=17)return 17; if(h>=14)return 14;
+  if(h>=11)return 11; if(h>=8)return 8;   if(h>=5)return 5;   if(h>=2)return 2; return 23;
+}
+
+// ================= DRAW BASIC =================
+void drawCard(int x,int y,int w,int h){
+  tft.drawRoundRect(x,y,w,h,8,C_LINE); tft.fillRoundRect(x+1,y+1,w-2,h-2,8,C_CARD);
+}
+void drawToggleButton(int x,int y,int w,int h,const char*label,bool on){
+  uint16_t fc=on?C_GREEN:C_CARD, bc=on?C_GREEN:C_LINE, tc=on?ILI9341_BLACK:C_WHITE;
+  tft.fillRoundRect(x,y,w,h,10,fc); tft.drawRoundRect(x,y,w,h,10,bc);
+  tft.setTextSize(2); tft.setTextColor(tc,fc);
+  tft.setCursor(x+18,y+12); tft.print(label);
+  tft.setCursor(x+w-42,y+12); tft.print(on?"ON":"OFF");
+}
+void drawHeader(const char*title){
+  tft.fillRect(0,0,320,37,C_BG);
+  tft.drawLine(0,36,320,36,C_LINE);
+  tft.setTextColor(C_WHITE,C_BG); tft.setTextSize(2);
+  tft.setCursor(105,10); tft.print(title);
+  tft.setCursor(10,10);  tft.print("<");
+  tft.setCursor(295,10); tft.print(">");
+  int dotY=18, dotX=232;
+  for(int i=PAGE_MIN;i<=PAGE_MAX;i++){
+    if(i==currentPage) tft.fillCircle(dotX+i*13,dotY,4,C_WHITE);
+    else               tft.drawCircle(dotX+i*13,dotY,4,C_GRAY);
+  }
+}
+bool pointInRect(int x,int y,int rx,int ry,int rw,int rh){
+  return(x>=rx&&x<=rx+rw&&y>=ry&&y<=ry+rh);
+}
+
+// ================= ICONS =================
+void drawBatteryIcon(int x,int y,int p){
+  tft.drawRoundRect(x,y,42,26,4,C_WHITE); tft.fillRect(x+42,y+8,4,10,C_WHITE);
+  int fw=map(p,0,100,0,34);
+  uint16_t c=p<25?C_RED:p<50?C_YELLOW:C_GREEN;
+  tft.fillRect(x+4,y+4,fw,18,c);
+}
+void drawModeIcon(int cx,int cy){
+  if(essMode=="ECO"){
+    tft.drawRoundRect(cx-13,cy-7,20,14,4,C_YELLOW);
+    tft.drawLine(cx+7,cy-3,cx+16,cy-3,C_YELLOW);
+    tft.drawLine(cx+7,cy+3,cx+16,cy+3,C_YELLOW);
+    tft.drawLine(cx-13,cy,cx-21,cy,C_YELLOW);
+    tft.drawCircle(cx-24,cy,3,C_YELLOW);
+  }else{
+    tft.drawRoundRect(cx-18,cy-11,30,22,4,C_GREEN);
+    tft.fillRect(cx+13,cy-4,4,8,C_GREEN);
+    tft.fillTriangle(cx-3,cy-9,cx-10,cy+2,cx-1,cy+2,C_CYAN);
+    tft.fillTriangle(cx-1,cy+2,cx-8,cy+12,cx+6,cy-2,C_CYAN);
+  }
+}
+
+// ================= LED =================
+void setTrafficLeds(bool r,bool y,bool g){
+  digitalWrite(TRAFFIC_LED_R_PIN,r?HIGH:LOW);
+  digitalWrite(TRAFFIC_LED_Y_PIN,y?HIGH:LOW);
+  digitalWrite(TRAFFIC_LED_G_PIN,g?HIGH:LOW);
+}
+
+void updateEssSourceLeds(){
+  // LED 의미:
+  // Y = ECO 모드 표시
+  // R = 외부전원 사용 / 외부전원 전환 대기 중 점멸
+  // G = 내부 배터리 사용
+  bool eco = isEcoModeActive();
+
+  // 사용자가 수동으로 외부전원을 선택한 경우:
+  // 5초 대기 중에는 실제 전원은 아직 내부 배터리이므로 G ON,
+  // 외부전원 전환 대기는 R 점멸로 표시한다.
+  if(manualExternalDelayActive){
+    unsigned long now = millis();
+    if(now - trafficLedLastToggle >= 250UL){
+      trafficLedLastToggle = now;
+      trafficLedBlinkState = !trafficLedBlinkState;
+    }
+    setTrafficLeds(trafficLedBlinkState, false, true);
+    return;
+  }
+
+  if(ecoExternalDelayActive){
+    unsigned long now = millis();
+    if(now - trafficLedLastToggle >= 250UL){
+      trafficLedLastToggle = now;
+      trafficLedBlinkState = !trafficLedBlinkState;
+    }
+
+    // 대기 중에는 아직 내부 배터리 사용이므로 G ON,
+    // ECO 상태는 Y ON, 외부전원 전환 대기는 R 점멸로 표시.
+    setTrafficLeds(trafficLedBlinkState, eco, true);
+    return;
+  }
+
+  bool external = (digitalRead(POWER_RELAY_PIN) == POWER_RELAY_EXTERNAL_ON);
+  setTrafficLeds(external, eco, !external);
+}
+
+// 일반 LED 점멸 (비blocking 구간에서만 사용)
+void updateTrafficLedBlink(){
+  if(apiLedHwActive) return;  // HW 타이머가 담당 중이면 skip
+  unsigned long now=millis(); unsigned long iv=180;
+
+  if(wifiDisconnectedAlert && trafficLedMode!=LED_MODE_WIFI_CONNECTING && trafficLedMode!=LED_MODE_API_LOADING){
+    if(now-trafficLedLastToggle>=500){
+      trafficLedLastToggle=now;
+      trafficLedBlinkState=!trafficLedBlinkState;
+    }
+    bool eco=isEcoModeActive();
+    bool external = (digitalRead(POWER_RELAY_PIN) == POWER_RELAY_EXTERNAL_ON);
+    setTrafficLeds(trafficLedBlinkState, eco, !external);
+    return;
+  }
+
+  switch(trafficLedMode){
+    case LED_MODE_ESS_ECO:       updateEssSourceLeds(); return;
+    case LED_MODE_ESS_NORMAL:    updateEssSourceLeds(); return;
+    case LED_MODE_WIFI_CONNECTED:setTrafficLeds(false,false,true);  return;
+    case LED_MODE_OFF:           setTrafficLeds(false,false,false); return;
+    case LED_MODE_TIME_SYNC:     iv=250; break;
+    case LED_MODE_API_LOADING:   iv=300; break;
+    default: break;
+  }
+  if(now-trafficLedLastToggle>=iv){trafficLedLastToggle=now;trafficLedBlinkState=!trafficLedBlinkState;}
+  switch(trafficLedMode){
+    case LED_MODE_WIFI_CONNECTING: setTrafficLeds(false,trafficLedBlinkState,false); break;
+    case LED_MODE_WIFI_FAILED:     setTrafficLeds(trafficLedBlinkState,false,false); break;
+    case LED_MODE_TIME_SYNC:       setTrafficLeds(false,false,trafficLedBlinkState); break;
+    case LED_MODE_API_FAILED:      setTrafficLeds(trafficLedBlinkState,trafficLedBlinkState,false); break;
+    case LED_MODE_API_LOADING:     setTrafficLeds(trafficLedBlinkState,trafficLedBlinkState,trafficLedBlinkState); break;
+    default: break;
+  }
+}
+
+// ================= ESS MODE =================
+void forceBatteryPowerMode(){
+  essMode="NORMAL";
+  cancelEcoExternalDelay();
+  if(powerSourceMode == POWER_SOURCE_AUTO) digitalWrite(POWER_RELAY_PIN,POWER_RELAY_BATTERY_ON);
+  trafficLedMode=LED_MODE_ESS_NORMAL;
+  updateEssSourceLeds();
+}
+bool isEcoModeActive(){return essMode=="ECO";}
+bool shouldForceMotorOff(){
+  return (essMode=="ECO" && batteryPercent<=ecoModeThresholdPercent);
+}
+
+void cancelEcoExternalDelay(){
+  ecoExternalDelayActive = false;
+}
+
+void cancelManualExternalDelay(){
+  manualExternalDelayActive = false;
+}
+
+void startManualExternalDelay(){
+  manualExternalDelayActive = true;
+  manualExternalDelayStartMs = millis();
+  trafficLedLastToggle = millis() - 250UL;
+  trafficLedBlinkState = false;
+
+  // 외부전원으로 전환하기 전 5초 동안 내부 배터리를 유지한다.
+  essMode = "MANUAL";
+  digitalWrite(POWER_RELAY_PIN, POWER_RELAY_BATTERY_ON);
+  trafficLedMode = LED_MODE_ESS_NORMAL;
+  updateEssSourceLeds();
+
+  addEventLog("외부전원 전환 대기");
+  Serial.println("[ESS] Manual external selected. Waiting 5s on battery before switching to external power.");
+}
+
+void startEcoExternalDelay(){
+  ecoExternalDelayActive = true;
+  ecoExternalDelayStartMs = millis();
+  trafficLedLastToggle = millis() - 250UL;
+  trafficLedBlinkState = false;
+
+  // 외부전원 전환 전 5초 동안 내부 배터리를 유지한다.
+  digitalWrite(POWER_RELAY_PIN, POWER_RELAY_BATTERY_ON);
+  trafficLedMode = LED_MODE_ESS_ECO;
+  updateEssSourceLeds();
+
+  Serial.println("[ESS] ECO detected. Waiting 5s on battery before switching to external power.");
+}
+
+void updateEcoExternalDelay(){
+  if(!ecoExternalDelayActive) return;
+
+  // 사용자가 수동 외부/배터리로 바꾸거나 ECO가 해제되면 대기 취소
+  if(powerSourceMode != POWER_SOURCE_AUTO || !isEcoModeActive()){
+    cancelEcoExternalDelay();
+    updateEssSourceLeds();
+    return;
+  }
+
+  if(millis() - ecoExternalDelayStartMs >= ECO_EXTERNAL_TRANSFER_DELAY_MS){
+    ecoExternalDelayActive = false;
+    digitalWrite(POWER_RELAY_PIN, POWER_RELAY_EXTERNAL_ON);
+    addEventLog("외부전원 전환");
+    trafficLedMode = LED_MODE_ESS_ECO;
+    updateEssSourceLeds();
+    Serial.println("[ESS] ECO transfer delay finished. Switched to external power.");
+
+    if(currentPage==PAGE_LOAD) drawLoadControlPage();
+    if(currentPage==PAGE_MAIN) updateMainDynamicValues();
+  }
+}
+
+void updateManualExternalDelay(){
+  if(!manualExternalDelayActive) return;
+
+  // 대기 중 사용자가 AUTO 또는 배터리 강제 모드로 바꾸면 수동 외부전원 대기를 취소한다.
+  if(powerSourceMode != POWER_SOURCE_FORCE_EXTERNAL){
+    cancelManualExternalDelay();
+    updateEssSourceLeds();
+    return;
+  }
+
+  if(millis() - manualExternalDelayStartMs >= ECO_EXTERNAL_TRANSFER_DELAY_MS){
+    manualExternalDelayActive = false;
+    essMode = "MANUAL";
+    digitalWrite(POWER_RELAY_PIN, POWER_RELAY_EXTERNAL_ON);
+    addEventLog("외부전원 전환");
+    trafficLedMode = LED_MODE_ESS_NORMAL;
+    updateEssSourceLeds();
+    Serial.println("[ESS] Manual external delay finished. Switched to external power.");
+
+    if(currentPage==PAGE_LOAD) drawLoadControlPage();
+    if(currentPage==PAGE_MAIN) updateMainDynamicValues();
+  }
+}
+
+void applyEssModeOutputs(){
+  // Manual source selection: bypass the automatic ESS source algorithm.
+  // AUTO mode below keeps the existing forecast/battery-based algorithm.
+  if(powerSourceMode == POWER_SOURCE_FORCE_EXTERNAL){
+    cancelEcoExternalDelay();
+    essMode="MANUAL";
+
+    // 이미 외부전원 사용 중이면 즉시 상태만 갱신한다.
+    // 내부 배터리 사용 중 외부전원을 선택한 경우에는 5초 대기 후 전환한다.
+    if(digitalRead(POWER_RELAY_PIN) != POWER_RELAY_EXTERNAL_ON){
+      if(!manualExternalDelayActive) startManualExternalDelay();
+      applyLoadOutputs();
+      return;
+    }
+
+    cancelManualExternalDelay();
+    digitalWrite(POWER_RELAY_PIN,POWER_RELAY_EXTERNAL_ON);
+    trafficLedMode=LED_MODE_ESS_NORMAL;
+    applyLoadOutputs();
+    updateEssSourceLeds();
+    return;
+  }
+
+  if(powerSourceMode == POWER_SOURCE_FORCE_BATTERY){
+    cancelEcoExternalDelay();
+    cancelManualExternalDelay();
+    essMode="MANUAL";
+    // Safety protection: at 10% or lower, external power is forced even in manual battery mode.
+    if(batteryPercent <= CRITICAL_BATTERY_EXTERNAL_PERCENT)
+      digitalWrite(POWER_RELAY_PIN,POWER_RELAY_EXTERNAL_ON);
+    else
+      digitalWrite(POWER_RELAY_PIN,POWER_RELAY_BATTERY_ON);
+      addEventLog("배터리 사용 전환");
+    trafficLedMode=LED_MODE_ESS_NORMAL;
+    applyLoadOutputs();
+    updateEssSourceLeds();
+    return;
+  }
+
+  // AUTO 모드로 돌아오면 수동 외부전원 전환 대기는 취소한다.
+  cancelManualExternalDelay();
+
+  // AUTO: ECO 모드이면 외부전원으로 가되, 바로 전환하지 않고 5초 동안 배터리 유지
+  if(isEcoModeActive()){
+    if(shouldForceMotorOff()) motorLoadOn=false;
+    digitalWrite(MOTOR_RELAY_PIN,MOTOR_RELAY_OFF);
+
+    if(digitalRead(POWER_RELAY_PIN) != POWER_RELAY_EXTERNAL_ON && !ecoExternalDelayActive){
+      startEcoExternalDelay();
+    }
+
+    trafficLedMode=LED_MODE_ESS_ECO;
+  }else{
+    cancelEcoExternalDelay();
+    digitalWrite(POWER_RELAY_PIN,POWER_RELAY_BATTERY_ON);
+    trafficLedMode=LED_MODE_ESS_NORMAL;
+  }
+  applyLoadOutputs();
+  updateEssSourceLeds();
+}
+void updateEssModeByBatteryAndForecast(){
+  if(powerSourceMode != POWER_SOURCE_AUTO){
+    applyEssModeOutputs();
+    return;
+  }
+  const char*tl=genLevelText(tomorrowGenWh);
+  if(!initialKmaFetched||!isApiForecastOk()){forceBatteryPowerMode();return;}
+  if(batteryPercent<=ecoModeThresholdPercent) essMode="ECO";
+  else if(strcmp(tl,"LOW")==0)                essMode="ECO";
+  else                                         essMode="NORMAL";
+  applyEssModeOutputs();
+}
+void updateEssModeByTomorrowForecast(){updateEssModeByBatteryAndForecast();}
+
+// ================= BOOT SPLASH =================
+void drawBootSplashWithFastLedSequence(){
+  tft.fillScreen(C_BG);
+  tft.setTextColor(C_CYAN,C_BG);
+  tft.setTextSize(2);
+
+  const char* l1 = "Weather Data-Driven";
+  const char* l2 = "Microgrid EMS";
+  int16_t x1,y1,x2,y2;
+  uint16_t w1,h1,w2,h2;
+  tft.getTextBounds(l1,0,0,&x1,&y1,&w1,&h1);
+  tft.getTextBounds(l2,0,0,&x2,&y2,&w2,&h2);
+  tft.setCursor((320-w1)/2,92);  tft.print(l1);
+  tft.setCursor((320-w2)/2,122); tft.print(l2);
+
+  // 3초 동안 R -> Y -> G 신호등 LED 빠른 순차 점멸
+  unsigned long sm = millis();
+  int step = 0;
+  while(millis() - sm < 3000UL){
+    if(step == 0)      setTrafficLeds(true,false,false);
+    else if(step == 1) setTrafficLeds(false,true,false);
+    else               setTrafficLeds(false,false,true);
+    step = (step + 1) % 3;
+    delay(80);
+  }
+  setTrafficLeds(false,false,false);
+}
+
+// ================= LOAD CONTROL =================
+void applyLoadOutputs(){
+  if(shouldForceMotorOff()) motorLoadOn=false;
+  digitalWrite(LED_LOAD_PIN,ledLoadOn?HIGH:LOW);
+  digitalWrite(MOTOR_RELAY_PIN,motorLoadOn?MOTOR_RELAY_ON:MOTOR_RELAY_OFF);
+  allLoadOn=(ledLoadOn&&motorLoadOn);
+}
+void drawSmallModeButton(int x,int y,int w,int h,const char*label,bool selected,uint16_t accent){
+  uint16_t fill = selected ? accent : C_CARD;
+  uint16_t text = selected ? ILI9341_BLACK : C_WHITE;
+  tft.fillRoundRect(x,y,w,h,8,fill);
+  tft.drawRoundRect(x,y,w,h,8,selected ? accent : C_LINE);
+  tft.setTextSize(1);
+  tft.setTextColor(text,fill);
+  int tx = x + 10;
+  if(strlen(label) <= 4) tx = x + 28;
+  tft.setCursor(tx,y+12);
+  tft.print(label);
+}
+
+void drawLoadControlPage(){
+  tft.fillScreen(C_BG); drawHeader("POWER");
+
+  drawCard(6,44,150,190);
+  drawCard(164,44,150,190);
+  tft.drawLine(160,44,160,234,C_LINE);
+
+  // Left: load control
+  tft.setTextSize(1); tft.setTextColor(C_YELLOW,C_CARD);
+  tft.setCursor(18,56); tft.print("LOAD CONTROL");
+  drawToggleButton(16,78,130,34,"ALL",allLoadOn);
+  drawToggleButton(16,122,130,34,"MOTOR",motorLoadOn);
+  drawToggleButton(16,166,130,34,"LED",ledLoadOn);
+
+  // Right: power source selection
+  tft.setTextSize(1); tft.setTextColor(C_CYAN,C_CARD);
+  tft.setCursor(176,56); tft.print("POWER SOURCE");
+  drawSmallModeButton(174,78,130,34,"EXTERNAL",powerSourceMode==POWER_SOURCE_FORCE_EXTERNAL,C_CYAN);
+  drawSmallModeButton(174,122,130,34,"BATTERY", powerSourceMode==POWER_SOURCE_FORCE_BATTERY,C_GREEN);
+  drawSmallModeButton(174,166,130,34,"AUTO",    powerSourceMode==POWER_SOURCE_AUTO,C_YELLOW);
+
+  // Bottom status
+  tft.setTextSize(1);
+  tft.setTextColor(C_WHITE,C_BG);
+  tft.setCursor(12,222); tft.print("Mode:");
+  tft.setTextColor(C_YELLOW,C_BG); tft.print(powerSourceModeText());
+  tft.setTextColor(C_WHITE,C_BG); tft.setCursor(174,222); tft.print("Src:");
+  tft.setTextColor(C_GREEN,C_BG); tft.print(activePowerSourceText());
+}
+void handleLoadControlTap(int x,int y){
+  if(pointInRect(x,y,16,78,130,34)){
+    bool t=!allLoadOn; motorLoadOn=shouldForceMotorOff()?false:t; ledLoadOn=t;
+    applyLoadOutputs(); delay(180); drawLoadControlPage();
+  } else if(pointInRect(x,y,16,122,130,34)){
+    motorLoadOn=isEcoModeActive()?false:!motorLoadOn;
+    applyLoadOutputs(); delay(180); drawLoadControlPage();
+  } else if(pointInRect(x,y,16,166,130,34)){
+    ledLoadOn=!ledLoadOn; applyLoadOutputs(); delay(180); drawLoadControlPage();
+  } else if(pointInRect(x,y,174,78,130,34)){
+    powerSourceMode=POWER_SOURCE_FORCE_EXTERNAL;
+    applyEssModeOutputs(); delay(180); drawLoadControlPage();
+  } else if(pointInRect(x,y,174,122,130,34)){
+    powerSourceMode=POWER_SOURCE_FORCE_BATTERY;
+    applyEssModeOutputs(); delay(180); drawLoadControlPage();
+  } else if(pointInRect(x,y,174,166,130,34)){
+    powerSourceMode=POWER_SOURCE_AUTO;
+    updateEssModeByBatteryAndForecast(); delay(180); drawLoadControlPage();
+  }
+}
+
+// ================= MAIN PAGE =================
+void drawMainPage(){
+  tft.fillScreen(C_BG);
+  drawHeader("MAIN");
+
+  // 좌측 센서 영역 약 2/3, 우측 시간별 발전량 영역 약 1/3
+  const int SPLIT_X = 214;
+  const int LEFT_X  = 4;
+  const int LEFT_W  = 206;
+  const int RIGHT_X = 218;
+  const int RIGHT_W = 98;
+  tft.drawLine(SPLIT_X,37,SPLIT_X,240,C_LINE);
+
+  // 좌측: 항목명은 흰색/큰 글씨, 실시간 값은 우측에 더 크게 표시
+  // Solar Power
+  drawCard(LEFT_X,40,LEFT_W,42);
+  tft.setTextSize(2); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(12,54); tft.print("SOLAR");
+  tft.setTextSize(3); tft.setTextColor(C_YELLOW,C_CARD); tft.setCursor(128,50); tft.print(solarPower,1);
+  tft.setTextSize(1); tft.print("W");
+
+  // Battery
+  drawCard(LEFT_X,86,LEFT_W,42);
+  uint16_t battColor = batteryPercent<25?C_RED:batteryPercent<50?C_YELLOW:C_GREEN;
+  tft.setTextSize(2); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(12,100); tft.print("BAT");
+  drawBatteryIcon(100,94,batteryPercent);
+  tft.setTextSize(3); tft.setTextColor(battColor,C_CARD); tft.setCursor(150,94); tft.print(batteryPercent);
+  tft.setTextSize(1); tft.print("%");
+
+  // Load Power
+  drawCard(LEFT_X,132,LEFT_W,42);
+  tft.setTextSize(2); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(12,146); tft.print("LOAD");
+  tft.setTextSize(3); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(128,142); tft.print(loadPower,1);
+  tft.setTextSize(1); tft.print("W");
+
+  // ESS Mode: 로고 + 모드명을 우측에 크게 표시
+  drawCard(LEFT_X,178,LEFT_W,55);
+  tft.setTextSize(2); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(12,197); tft.print("ESS");
+  drawModeIcon(112,205);
+  uint16_t modeColor = isEcoModeActive() ? C_YELLOW : C_GREEN;
+  tft.setTextSize(2); tft.setTextColor(modeColor,C_CARD); tft.setCursor(142,197); tft.print(essMode);
+
+  // 우측: 현재 시간대 예상/실제 발전량 1/3 영역
+  struct tm ti; int nh=0; if(getLocalTime(&ti))nh=ti.tm_hour;
+  int si=nh-SOLAR_SLOT_START_HOUR;
+  float predWh=(si>=0&&si<SOLAR_SLOT_COUNT)?todayHourlyGenWh[si]:0;
+  float actWh=currentSlotAccumWh;
+  float errRate=0; if(predWh>0.1f)errRate=(actWh-predWh)/predWh*100.0f;
+  uint16_t ec=(errRate>=0)?C_GREEN:C_RED;
+
+  drawCard(RIGHT_X,40,RIGHT_W,58);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(RIGHT_X+7,47); tft.print("Hr Pred");
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(RIGHT_X+7,63); tft.print(predWh,2);
+  tft.setTextSize(1); tft.print("Wh");
+
+  drawCard(RIGHT_X,103,RIGHT_W,58);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(RIGHT_X+7,110); tft.print("Hr Act");
+  tft.setTextSize(2); tft.setTextColor(C_GREEN,C_CARD); tft.setCursor(RIGHT_X+7,126); tft.print(actWh,2);
+  tft.setTextSize(1); tft.print("Wh");
+
+  drawCard(RIGHT_X,166,RIGHT_W,67);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(RIGHT_X+7,173); tft.print("Error");
+  tft.setTextSize(2); tft.setTextColor(ec,C_CARD); tft.setCursor(RIGHT_X+7,190);
+  if(errRate>0)tft.print("+"); tft.print(errRate,2);
+  tft.setTextSize(1); tft.print("%");
+}
+
+void updateMainDynamicValues(){
+  const int LEFT_X  = 4;
+  const int RIGHT_X = 218;
+
+  // 좌측 값 영역만 갱신: 항목명은 유지하고 숫자/아이콘만 다시 그림
+  tft.fillRect(120,48,88,30,C_CARD);
+  tft.setTextSize(3); tft.setTextColor(C_YELLOW,C_CARD); tft.setCursor(128,50); tft.print(solarPower,1);
+  tft.setTextSize(1); tft.print("W");
+
+  uint16_t battColor = batteryPercent<25?C_RED:batteryPercent<50?C_YELLOW:C_GREEN;
+  tft.fillRect(96,92,112,32,C_CARD);
+  drawBatteryIcon(100,94,batteryPercent);
+  tft.setTextSize(3); tft.setTextColor(battColor,C_CARD); tft.setCursor(150,94); tft.print(batteryPercent);
+  tft.setTextSize(1); tft.print("%");
+
+  tft.fillRect(120,140,88,30,C_CARD);
+  tft.setTextSize(3); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(128,142); tft.print(loadPower,1);
+  tft.setTextSize(1); tft.print("W");
+
+  tft.fillRect(92,187,116,38,C_CARD);
+  drawModeIcon(112,205);
+  uint16_t modeColor = isEcoModeActive() ? C_YELLOW : C_GREEN;
+  tft.setTextSize(2); tft.setTextColor(modeColor,C_CARD); tft.setCursor(142,197); tft.print(essMode);
+
+  struct tm ti; int nh=0; if(getLocalTime(&ti))nh=ti.tm_hour;
+  int si=nh-SOLAR_SLOT_START_HOUR;
+  float predWh=(si>=0&&si<SOLAR_SLOT_COUNT)?todayHourlyGenWh[si]:0;
+  float actWh=currentSlotAccumWh;
+  float errRate=0; if(predWh>0.1f)errRate=(actWh-predWh)/predWh*100.0f;
+  uint16_t ec=(errRate>=0)?C_GREEN:C_RED;
+
+  tft.fillRect(RIGHT_X+2,61,94,24,C_CARD);
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(RIGHT_X+7,63); tft.print(predWh,2);
+  tft.setTextSize(1); tft.print("Wh");
+
+  tft.fillRect(RIGHT_X+2,124,94,24,C_CARD);
+  tft.setTextSize(2); tft.setTextColor(C_GREEN,C_CARD); tft.setCursor(RIGHT_X+7,126); tft.print(actWh,2);
+  tft.setTextSize(1); tft.print("Wh");
+
+  tft.fillRect(RIGHT_X+2,188,94,30,C_CARD);
+  tft.setTextSize(2); tft.setTextColor(ec,C_CARD); tft.setCursor(RIGHT_X+7,190);
+  if(errRate>0)tft.print("+"); tft.print(errRate,2);
+  tft.setTextSize(1); tft.print("%");
+}
+
+// ================= ESP32 WEB SERVER =================
+String powerSourceModeValue(){
+  switch(powerSourceMode){
+    case POWER_SOURCE_FORCE_EXTERNAL: return "ext";
+    case POWER_SOURCE_FORCE_BATTERY:  return "bat";
+    default:                          return "auto";
+  }
+}
+
+String jsonEscape(const String& s){
+  String out;
+  out.reserve(s.length()+4);
+  for(size_t i=0;i<s.length();i++){
+    char c=s[i];
+    if(c=='\\' || c=='\"'){ out += '\\'; out += c; }
+    else if(c=='\n') out += "\\n";
+    else if(c=='\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+void appendJsonFloat(String& json, const char* key, float value, int digits){
+  json += "\"";
+  json += key;
+  json += "\":";
+  json += String(value, digits);
+}
+
+static const char WEB_INDEX[] PROGMEM = R"=====(<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Microgrid EMS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{
+  background:#111;
+  min-height:100vh;
+  min-height:100dvh;
+  display:flex;
+  justify-content:center;
+  padding:8px 0 18px;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+  color:#fff;
+  overflow:hidden;
+}
+.device{
+  width:min(393px,100vw);
+  height:min(852px,calc(100dvh - 16px));
+  background:#000;
+  border-radius:44px;
+  border:2px solid #333;
+  overflow:hidden;
+  position:relative;
+  display:flex;
+  flex-direction:column;
+}
+.island{
+  position:absolute;
+  top:10px;
+  left:50%;
+  transform:translateX(-50%);
+  width:120px;
+  height:34px;
+  background:#000;
+  border-radius:20px;
+  z-index:8;
+}
+.sbar{
+  height:56px;
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  padding:0 28px 9px;
+  flex-shrink:0;
+}
+.sbar-time{font-size:17px;font-weight:700}
+.sbar-icons{font-size:12px;color:#fff}
+.app{
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  background:#000;
+}
+.topbar{
+  height:50px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 20px;
+  border-bottom:.5px solid #1c1c1e;
+  flex-shrink:0;
+}
+.topbar-title{font-size:17px;font-weight:700}
+.topbar-badge{
+  font-size:11px;
+  padding:3px 8px;
+  border-radius:10px;
+  font-weight:800;
+  background:#1c3a2e;
+  color:#30d158;
+}
+.pages-wrap{
+  flex:1;
+  overflow:hidden;
+}
+.pages{
+  display:flex;
+  height:100%;
+  transition:transform .32s cubic-bezier(.4,0,.2,1);
+}
+.page{
+  width:min(393px,100vw);
+  flex-shrink:0;
+  height:100%;
+  overflow-y:auto;
+  padding:14px 16px 126px;
+  -webkit-overflow-scrolling:touch;
+}
+.page::-webkit-scrollbar{display:none}
+
+/* Safari 주소창에 하단 탭이 가려지지 않게 위로 올림 */
+.bnav{
+  height:78px;
+  background:rgba(0,0,0,.97);
+  border-top:.5px solid #1c1c1e;
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-around;
+  padding-top:4px;
+  padding-bottom:calc(8px + env(safe-area-inset-bottom));
+}
+.bni{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:3px;
+  min-width:64px;
+  cursor:pointer;
+  color:#636366;
+  font-size:10px;
+}
+.bni i{font-style:normal;font-size:22px}
+.bni.active{color:#a78bfa}
+.bni-dot{
+  width:4px;
+  height:4px;
+  border-radius:50%;
+  background:#a78bfa;
+  margin-top:1px;
+}
+
+.section-label{
+  font-size:13px;
+  font-weight:600;
+  color:#636366;
+  margin:14px 0 8px;
+}
+.stat4{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:8px;
+  margin-bottom:12px;
+}
+.stat-c,.card,.sw-row,.eco-card,.day-c{
+  background:#1c1c1e;
+  border-radius:16px;
+}
+.stat-c{padding:11px 13px}
+.lbl{
+  font-size:11px;
+  color:#636366;
+  margin-bottom:3px;
+  display:flex;
+  align-items:center;
+  gap:4px;
+}
+.val{
+  font-size:22px;
+  font-weight:800;
+  letter-spacing:-.5px;
+  line-height:1;
+}
+.sub{
+  font-size:11px;
+  color:#636366;
+  margin-top:2px;
+}
+.yellow{color:#ffd60a}
+.green{color:#30d158}
+.cyan{color:#64d2ff}
+.orange{color:#ff9f0a}
+.red{color:#ff453a}
+.purple{color:#bf5af2}
+.gray{color:#8e8e93}
+.card{
+  padding:14px;
+  margin-bottom:10px;
+}
+.card-hdr{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:10px;
+}
+.card-title{font-size:13px;font-weight:700}
+.card-sub{font-size:11px;color:#636366}
+.chart{
+  width:100%;
+  height:120px;
+  border-radius:8px;
+  display:block;
+  background:#111;
+}
+.prog-row{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:6px;
+}
+.pr-lbl{font-size:11px;color:#636366;width:42px}
+.pr-bar{
+  flex:1;
+  height:5px;
+  background:#2c2c2e;
+  border-radius:3px;
+  overflow:hidden;
+}
+.pr-fill{
+  height:100%;
+  border-radius:3px;
+  transition:width .5s;
+}
+.pr-val{
+  font-size:11px;
+  width:45px;
+  text-align:right;
+}
+.day3{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:6px;
+  margin-bottom:10px;
+}
+.day-c{
+  padding:10px 8px;
+  text-align:center;
+}
+.d-lbl{font-size:11px;color:#636366;margin-bottom:4px}
+.d-val{font-size:18px;font-weight:800}
+.d-sub{font-size:10px;color:#636366}
+.d-badge{
+  font-size:9px;
+  padding:2px 6px;
+  border-radius:8px;
+  margin-top:4px;
+  display:inline-block;
+  font-weight:800;
+}
+.badge-hi{background:#1c3a2e;color:#30d158}
+.badge-mid{background:#3a2e00;color:#ffd60a}
+.badge-lo{background:#3a1c1c;color:#ff453a}
+.sw-row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:13px 16px;
+  margin-bottom:8px;
+}
+.sw-lbl{font-size:15px;font-weight:600}
+.sw-sub{font-size:12px;color:#636366;margin-top:2px}
+.toggle{
+  width:51px;
+  height:31px;
+  border-radius:16px;
+  background:#636366;
+  position:relative;
+  cursor:pointer;
+  transition:background .2s;
+  flex-shrink:0;
+}
+.toggle.on{background:#34c759}
+.toggle.disabled{opacity:.35}
+.toggle:after{
+  content:'';
+  position:absolute;
+  top:3px;
+  left:3px;
+  width:25px;
+  height:25px;
+  border-radius:50%;
+  background:#fff;
+  transition:left .2s;
+}
+.toggle.on:after{left:23px}
+.src-btns{
+  display:flex;
+  gap:6px;
+  margin-bottom:10px;
+}
+.src-btn{
+  flex:1;
+  background:#1c1c1e;
+  border-radius:12px;
+  padding:12px 6px;
+  text-align:center;
+  cursor:pointer;
+  border:1.5px solid transparent;
+}
+.src-btn.active{
+  border-color:#a78bfa;
+  background:#2c1f4a;
+}
+.sb-icon{font-size:20px;margin-bottom:4px}
+.sb-lbl{font-size:11px;font-weight:700}
+.sb-sub{font-size:10px;color:#636366;margin-top:1px}
+.eco-card{
+  padding:14px;
+  margin-bottom:10px;
+}
+.eco-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:12px;
+}
+.eco-title{font-size:13px;font-weight:700}
+.eco-val{
+  font-size:24px;
+  font-weight:800;
+  color:#ffd60a;
+}
+input[type=range]{
+  -webkit-appearance:none;
+  width:100%;
+  height:4px;
+  border-radius:2px;
+  background:#2c2c2e;
+  outline:none;
+  margin:6px 0;
+}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;
+  width:22px;
+  height:22px;
+  border-radius:50%;
+  background:#fff;
+  cursor:pointer;
+}
+.ch-tbl,.hour-tbl{
+  width:100%;
+  border-collapse:collapse;
+}
+.ch-tbl th,.hour-tbl th{
+  font-size:10px;
+  color:#636366;
+  padding:4px 0;
+  text-align:right;
+  font-weight:600;
+}
+.ch-tbl th:first-child,.hour-tbl th:first-child{text-align:left}
+.ch-tbl td,.hour-tbl td{
+  font-size:13px;
+  color:#fff;
+  padding:7px 0;
+  border-top:.5px solid #2c2c2e;
+  text-align:right;
+  font-family:ui-monospace,Menlo,monospace;
+}
+.ch-tbl td:first-child,.hour-tbl td:first-child{
+  text-align:left;
+  color:#636366;
+  font-family:-apple-system,sans-serif;
+  font-size:12px;
+}
+.log-item{
+  display:flex;
+  gap:10px;
+  padding:9px 0;
+  border-bottom:.5px solid #1c1c1e;
+}
+.log-dot{
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  margin-top:4px;
+  flex-shrink:0;
+}
+.log-msg{font-size:13px}
+.log-time{
+  font-size:11px;
+  color:#636366;
+  margin-top:2px;
+}
+.mini-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:8px;
+}
+.mini{
+  background:#111;
+  border-radius:10px;
+  padding:10px;
+}
+.mini-l{font-size:11px;color:#636366}
+.mini-v{
+  font-size:20px;
+  font-weight:800;
+  margin-top:2px;
+}
+.sys-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:8px;
+  margin-bottom:10px;
+}
+.sys-btn{
+  flex:1;
+  background:#1c1c1e;
+  border:.5px solid #3a3a3c;
+  border-radius:12px;
+  color:#64d2ff;
+  font-size:13px;
+  padding:13px;
+  font-weight:600;
+  cursor:pointer;
+}
+.tabs{
+  display:flex;
+  gap:6px;
+  margin-bottom:10px;
+}
+.tab{
+  flex:1;
+  background:#111;
+  border:1px solid #2c2c2e;
+  border-radius:10px;
+  color:#8e8e93;
+  padding:9px 0;
+  font-size:12px;
+  font-weight:700;
+}
+.tab.active{
+  background:#2c1f4a;
+  color:#a78bfa;
+  border-color:#a78bfa;
+}
+.tabpane{display:none}
+.tabpane.active{display:block}
+.page-dots{
+  display:flex;
+  justify-content:center;
+  gap:5px;
+  padding:8px 0;
+}
+.page-dot{
+  width:6px;
+  height:6px;
+  border-radius:3px;
+  background:#2c2c2e;
+}
+.page-dot.active{
+  width:18px;
+  background:#a78bfa;
+}
+.legend{
+  display:flex;
+  gap:14px;
+  margin-top:8px;
+  font-size:11px;
+}
+.legend span{
+  display:flex;
+  align-items:center;
+  gap:4px;
+}
+.line{
+  display:inline-block;
+  width:20px;
+  height:2px;
+  border-radius:1px;
+}
+.sq{
+  display:inline-block;
+  width:10px;
+  height:10px;
+  border-radius:2px;
+}
+.sr-only{
+  position:absolute;
+  width:1px;
+  height:1px;
+  overflow:hidden;
+  clip:rect(0,0,0,0);
+}
+
+/* 작은 휴대폰 대응 */
+@media(max-height:760px){
+  body{
+    padding:0;
+    overflow:hidden;
+  }
+
+  .device{
+    border-radius:0;
+    border:0;
+    width:100vw;
+    height:100dvh;
+  }
+
+  .sbar{
+    height:46px;
+    padding:0 18px 6px;
+  }
+
+  .sbar-time{
+    font-size:13px;
+    font-weight:700;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    max-width:78vw;
+  }
+
+  .island{
+    display:none;
+  }
+
+  .bnav{
+    height:64px;
+    padding-top:4px;
+    padding-bottom:calc(4px + env(safe-area-inset-bottom));
+    align-items:flex-start;
+  }
+
+  .bni{
+    gap:1px;
+    font-size:10px;
+  }
+
+  .bni i{
+    font-size:20px;
+  }
+
+  .page{
+    padding-bottom:78px;
+  }
+}
+
+/* 노트북/태블릿 가로 화면: 폰 프레임 제거 + 3열 대시보드 */
+@media(min-width:800px) and (orientation:landscape){
+  body{
+    display:block;
+    padding:18px;
+    overflow:auto;
+    background:#0b0b0d;
+  }
+  .device{
+    width:100%;
+    max-width:1280px;
+    height:auto;
+    min-height:calc(100dvh - 36px);
+    margin:0 auto;
+    border:0;
+    border-radius:24px;
+    background:#000;
+    box-shadow:0 18px 60px rgba(0,0,0,.45);
+  }
+  .island,.sbar,.bnav,.page-dots{
+    display:none!important;
+  }
+  .app{
+    min-height:calc(100dvh - 36px);
+  }
+  .topbar{
+    height:64px;
+    padding:0 26px;
+    border-bottom:1px solid #1c1c1e;
+  }
+  .topbar-title{
+    font-size:20px;
+  }
+  .topbar-title:after{
+    content:'  ·  Desktop Dashboard';
+    color:#636366;
+    font-size:13px;
+    font-weight:600;
+  }
+  .pages-wrap{
+    flex:1;
+    overflow:visible;
+  }
+  .pages{
+    display:grid;
+    grid-template-columns:340px minmax(360px,1fr) 420px;
+    gap:16px;
+    height:auto;
+    min-height:calc(100dvh - 100px);
+    padding:16px;
+    transform:none!important;
+    transition:none!important;
+  }
+  .page{
+    width:auto;
+    height:auto;
+    max-height:none;
+    flex-shrink:1;
+    overflow:visible;
+    padding:0;
+  }
+  #page-ctrl{
+    order:1;
+  }
+  #page-home{
+    order:2;
+  }
+  #page-data{
+    order:3;
+  }
+  .section-label{
+    margin-top:0;
+  }
+  .stat4{
+    grid-template-columns:repeat(4,1fr);
+  }
+  .chart{
+    height:150px;
+  }
+  #rt-canvas{
+    height:150px!important;
+  }
+  #cmp-canvas{
+    height:120px!important;
+  }
+  #hour-canvas{
+    height:160px!important;
+  }
+  .card,.stat-c,.sw-row,.eco-card,.day-c{
+    background:#1c1c1e;
+    border:1px solid #2c2c2e;
+  }
+}
+
+/* 중간 크기 가로 화면 */
+@media(min-width:800px) and (max-width:1050px) and (orientation:landscape){
+  .pages{
+    grid-template-columns:320px minmax(340px,1fr);
+  }
+  #page-data{
+    grid-column:1 / -1;
+  }
+  .stat4{
+    grid-template-columns:repeat(2,1fr);
+  }
+}
+</style></head><body><h1 class="sr-only">ESP32 Microgrid EMS WebApp</h1><div class="device"><div class="island"></div><div class="sbar"><div class="sbar-time" id="clock">기상정보 기반 마이크로그리드 EMS</div><div class="sbar-icons">WiFi ■■■■</div></div><div class="app"><div class="topbar"><div class="topbar-title" id="page-title">EMS 대시보드</div><div class="topbar-badge" id="top-badge">--</div></div><div class="pages-wrap"><div class="pages" id="pages">
+<div class="page" id="page-ctrl"><div class="section-label">부하 제어</div><div class="sw-row"><div><div class="sw-lbl">LED 부하</div><div class="sw-sub">GPIO14 출력</div></div><div class="toggle" id="tgl-led" onclick="toggleLoad('led')"></div></div><div class="sw-row"><div><div class="sw-lbl">모터 릴레이</div><div class="sw-sub">ECO 모드 시 자동 OFF</div></div><div class="toggle" id="tgl-motor" onclick="toggleLoad('motor')"></div></div><div class="sw-row"><div><div class="sw-lbl">전체 부하</div><div class="sw-sub">LED + Motor</div></div><div class="toggle" id="tgl-all" onclick="toggleLoad('all')"></div></div><div class="section-label">전원 소스</div><div class="src-btns"><div class="src-btn" id="src-auto" onclick="setSource('auto')"><div class="sb-icon purple">↻</div><div class="sb-lbl">AUTO</div><div class="sb-sub">ESS 판단</div></div><div class="src-btn" id="src-ext" onclick="setSource('ext')"><div class="sb-icon cyan">⎋</div><div class="sb-lbl">외부 전원</div><div class="sb-sub">Force Ext</div></div><div class="src-btn" id="src-bat" onclick="setSource('bat')"><div class="sb-icon green">▰</div><div class="sb-lbl">배터리</div><div class="sb-sub">Force Bat</div></div></div><div class="eco-card"><div class="eco-top"><div><div class="eco-title">ECO 절전 임계값</div><div class="sub">배터리 이하 시 ECO 전환</div></div><div class="eco-val" id="eco-display">--%</div></div><input type="range" min="5" max="95" value="30" step="1" id="eco-slider" oninput="ecoSlide(this.value)" onchange="setEco(this.value)"></div><div class="section-label">시스템</div><div class="sys-grid"><div class="card" style="margin-bottom:0;padding:12px"><div class="sub">WiFi 상태</div><div id="sys-wifi" class="mini-v green">--</div><div id="sys-ip" class="sub">--</div></div><div class="card" style="margin-bottom:0;padding:12px"><div class="sub">API 동기화</div><div id="sys-sync" class="mini-v">--</div><div id="sys-api" class="sub">--</div></div></div><div style="display:flex;gap:8px"><button class="sys-btn" onclick="sendCmd('/wifiReconnect')">WiFi 재연결</button><button class="sys-btn" style="color:#a78bfa" onclick="sendCmd('/apiRefresh')">API 새로고침</button></div><div class="page-dots"><div class="page-dot active"></div><div class="page-dot"></div><div class="page-dot"></div></div></div>
+<div class="page" id="page-home"><div class="stat4"><div class="stat-c"><div class="lbl">☀ 태양광</div><div class="val yellow" id="h-solar">-- W</div><div class="sub" id="h-solar-sub">--V · --A</div></div><div class="stat-c"><div class="lbl">🔋 배터리</div><div class="val green" id="h-batt">--%</div><div class="sub" id="h-batt-ah">-- / -- Ah</div></div><div class="stat-c"><div class="lbl">⚡ 부하</div><div class="val cyan" id="h-load">-- W</div><div class="sub" id="h-load-sub">--V · --A</div></div><div class="stat-c"><div class="lbl">🍃 전력 수지</div><div class="val green" id="h-balance">-- W</div><div class="sub" id="h-balance-sub">--</div></div></div><div class="card"><div class="card-hdr"><div class="card-title">실시간 발전 / 부하</div><div class="card-sub" id="rt-timer">갱신 중...</div></div><canvas class="chart" id="rt-canvas" width="361" height="120"></canvas><div class="legend"><span class="yellow"><i class="line" style="background:#ffd60a"></i>태양광</span><span class="cyan"><i class="line" style="background:#64d2ff"></i>부하</span><span class="gray" style="margin-left:auto" id="rt-max-label">최대 -- W</span></div></div><div class="card"><div class="card-hdr"><div class="card-title">태양 고도 & 방위각</div><div class="card-sub" id="solar-pos-time">--</div></div><div class="mini-grid"><div class="mini" style="text-align:center"><div class="mini-l">고도각</div><div class="mini-v yellow" id="solar-alt">--°</div></div><div class="mini" style="text-align:center"><div class="mini-l">방위각</div><div class="mini-v orange" id="solar-az">--°</div></div></div><div style="margin-top:8px"><div class="sub" style="margin-bottom:4px">그림자 인수</div><div class="prog-row"><div class="pr-bar"><div class="pr-fill" id="shadow-bar" style="width:0;background:#ffd60a"></div></div><div class="pr-val yellow" id="shadow-val">--</div></div></div></div><div class="card"><div class="card-hdr"><div class="card-title">오늘 예상 vs 실제</div><div class="card-sub" id="today-err">오차 --</div></div><canvas id="cmp-canvas" width="361" height="90" style="width:100%;height:90px;display:block;background:#111;border-radius:8px"></canvas><div class="legend"><span class="cyan"><i class="sq" style="background:#64d2ff"></i>예상</span><span class="green"><i class="sq" style="background:#30d158"></i>실제</span></div></div><div class="card"><div class="card-hdr"><div class="card-title">현재시간 예상 VS 실제 발전량</div><div class="card-sub">현재 1시간 기준</div></div><div class="mini-grid"><div class="mini"><div class="mini-l">예상 발전량</div><div class="mini-v cyan" id="cur-pred">0.00 Wh</div></div><div class="mini"><div class="mini-l">실제 발전량</div><div class="mini-v green" id="cur-actual">0.00 Wh</div></div></div><div style="margin-top:8px"><div class="mini"><div class="mini-l">오차율</div><div class="mini-v" id="cur-error">0.00%</div></div></div></div><div class="page-dots"><div class="page-dot"></div><div class="page-dot active"></div><div class="page-dot"></div></div></div>
+<div class="page" id="page-data"><div class="section-label">3일 발전 예보</div><div class="day3"><div class="day-c"><div class="d-lbl">오늘</div><div class="d-val cyan" id="d-today">--</div><div class="d-sub">Wh</div><div class="d-badge" id="b-today">--</div></div><div class="day-c"><div class="d-lbl">내일</div><div class="d-val orange" id="d-tomorrow">--</div><div class="d-sub">Wh</div><div class="d-badge" id="b-tomorrow">--</div></div><div class="day-c"><div class="d-lbl">모레</div><div class="d-val green" id="d-after">--</div><div class="d-sub">Wh</div><div class="d-badge" id="b-after">--</div></div></div><div class="card"><div class="card-hdr"><div class="card-title">시간별 예상 발전량</div><div class="card-sub">06~18시</div></div><div class="tabs"><button class="tab active" id="tab-today" onclick="showTab('today')">오늘</button><button class="tab" id="tab-tomorrow" onclick="showTab('tomorrow')">내일</button><button class="tab" id="tab-after" onclick="showTab('after')">모레</button></div><div class="tabpane" id="pane-graph"><canvas id="hour-canvas" width="361" height="130" style="width:100%;height:130px;display:block;background:#111;border-radius:8px"></canvas><div class="legend"><span class="cyan"><i class="sq" style="background:#64d2ff"></i>예상</span><span class="green"><i class="sq" style="background:#30d158"></i>실제</span></div></div><div class="tabpane active" id="pane-today"></div><div class="tabpane" id="pane-tomorrow"></div><div class="tabpane" id="pane-after"></div></div><div class="card"><div class="card-hdr"><div class="card-title">INA3221 채널 상세</div><div class="card-sub" style="display:flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:#ff453a;display:inline-block;box-shadow:0 0 6px #ff453a"></span>실시간</div></div><table class="ch-tbl"><tr><th>채널</th><th>전압</th><th>전류</th><th>전력</th></tr><tr><td>CH1 Solar</td><td id="ch0v">--</td><td id="ch0i">--</td><td class="yellow" id="ch0p">--</td></tr><tr><td>Battery</td><td id="ch1v">--</td><td id="ch1i">--</td><td class="green" id="ch1p">--</td></tr><tr><td>CH3 Load</td><td id="ch2v">--</td><td id="ch2i">--</td><td class="cyan" id="ch2p">--</td></tr></table></div><div class="card"><div class="card-hdr"><div class="card-title">배터리 쿨롱 카운팅</div><div class="card-sub">BMS 상세</div></div><div class="mini-grid"><div class="mini"><div class="mini-l">잔량</div><div class="mini-v green" id="bms-ah">-- Ah</div><div class="sub" id="bms-cap">/ -- Ah</div></div><div class="mini"><div class="mini-l">SOC</div><div class="mini-v green" id="bms-soc">--%</div><div class="sub" id="bms-eco">ECO 기준 --%</div></div></div><div style="margin-top:8px"><div class="prog-row"><div class="pr-lbl">SOC</div><div class="pr-bar"><div class="pr-fill" id="soc-bar" style="width:0;background:#30d158"></div></div><div class="pr-val" id="soc-val">--%</div></div><div class="prog-row"><div class="pr-lbl">OCV</div><div class="pr-bar"><div class="pr-fill" id="ocv-bar" style="width:0;background:#64d2ff"></div></div><div class="pr-val" id="ocv-val">--V</div></div></div></div><div class="card"><div class="card-hdr"><div class="card-title">이벤트 로그</div><div class="card-sub">최근 상태</div></div><div id="log-list"></div></div><div class="page-dots"><div class="page-dot"></div><div class="page-dot"></div><div class="page-dot active"></div></div></div>
+</div></div><div class="bnav"><div class="bni" id="bni-ctrl" onclick="goPage(0)"><i>⚙</i><span>제어</span></div><div class="bni active" id="bni-home" onclick="goPage(1)"><i>⌂</i><span>홈</span><div class="bni-dot"></div></div><div class="bni" id="bni-data" onclick="goPage(2)"><i>▥</i><span>데이터</span></div></div></div></div>
+<script>
+let curPage=1,lastData=null,rtS=[],rtL=[],MAXN=60;const titles=['제어 & 설정','EMS 대시보드','예보 & 분석'],bnis=['bni-ctrl','bni-home','bni-data'];function $(id){return document.getElementById(id)}function cls(id,c){let e=$(id);if(e)e.className=c}function txt(id,v){let e=$(id);if(e)e.textContent=v}function fmt(v,n){v=Number(v);return isFinite(v)?v.toFixed(n):(0).toFixed(n)}function level(v){v=Number(v)||0;return v<18?['LOW','badge-lo']:v<36?['MID','badge-mid']:['HIGH','badge-hi']}function isDesktopLayout(){
+  return window.matchMedia('(min-width:800px) and (orientation:landscape)').matches;
+}
+
+function goPage(n){
+  curPage=n;
+
+  if(isDesktopLayout()){
+    $('pages').style.transform='none';
+    txt('page-title','기상정보 기반 마이크로그리드 EMS');
+  }else{
+    let w=document.querySelector('.page').clientWidth||393;
+    $('pages').style.transform='translateX('+(-n*w)+'px)';
+    txt('page-title',titles[n]);
+  }
+
+  bnis.forEach((id,i)=>{
+    let el=$(id);
+    if(!el)return;
+    el.className='bni'+(i===n?' active':'');
+    let dot=el.querySelector('.bni-dot');
+    if(i===n&&!dot){
+      dot=document.createElement('div');
+      dot.className='bni-dot';
+      el.appendChild(dot);
+    }
+    if(i!==n&&dot)dot.remove();
+  });
+}window.addEventListener('resize',()=>goPage(curPage));
+function setToggle(id,on,dis){let e=$(id);if(!e)return;e.className='toggle'+(on?' on':'')+(dis?' disabled':'')}async function sendCmd(path){try{let sep=path.indexOf('?')>=0?'&':'?';await fetch(path+sep+'ajax=1',{cache:'no-store'});setTimeout(updateData,120)}catch(e){}}function toggleLoad(t){if(t==='motor'&&lastData&&lastData.ess_mode==='ECO')return;sendCmd('/load?target='+t+'&value=toggle')}function setSource(m){sendCmd('/source?mode='+m)}function ecoSlide(v){txt('eco-display',v+'%');$('eco-slider').style.background='linear-gradient(to right,#ffd60a '+v+'%,#2c2c2e '+v+'%)'}async function setEco(v){ecoSlide(v);try{await fetch('/setEco?value='+encodeURIComponent(v)+'&ajax=1',{cache:'no-store'});setTimeout(updateData,120)}catch(e){}}
+function showTab(t){['today','tomorrow','after'].forEach(x=>{cls('tab-'+x,'tab '+(x===t?'active':''));cls('pane-'+x,'tabpane '+(x===t?'active':''))})}function hourTable(title,hours,arr,actualArr){
+let isToday=(title==='오늘');
+
+let h='<table class="hour-tbl"><tr>';
+h+='<th>시간</th><th>'+title+' 발전량</th>';
+
+if(isToday){
+  h+='<th>실제 발전량</th>';
+}
+
+h+='<th>시간</th><th>'+title+' 발전량</th>';
+
+if(isToday){
+  h+='<th>실제 발전량</th>';
+}
+
+h+='</tr>';
+
+let leftHours=(hours||[]).slice(0,7);
+let leftVals=(arr||[]).slice(0,7);
+
+let rightHours=(hours||[]).slice(7);
+let rightVals=(arr||[]).slice(7);
+
+for(let i=0;i<7;i++){
+  let h1=leftHours[i];
+  let v1=leftVals[i];
+  let a1=(actualArr||[])[i] || 0;
+
+  let h2=rightHours[i];
+  let v2=rightVals[i];
+  let a2=(actualArr||[])[i+7] || 0;
+
+  h+='<tr>';
+
+  // 좌측
+  let leftHour=(h1!==undefined)?String(h1).padStart(2,'0')+':00':'';
+  let leftVal=(v1!==undefined)?fmt(v1,2)+' Wh':'';
+
+  h+='<td style="color:#636366">'+leftHour+'</td>';
+  h+='<td>'+leftVal+'</td>';
+
+  if(isToday){
+    h+='<td style="color:#4cd964">'+fmt(a1,2)+' Wh</td>';
+  }
+
+  // 우측
+  if(h2!==undefined){
+    let rightHour=String(h2).padStart(2,'0')+':00';
+    let rightVal=fmt(v2,2)+' Wh';
+
+    h+='<td style="color:#636366">'+rightHour+'</td>';
+    h+='<td>'+rightVal+'</td>';
+
+    if(isToday){
+      h+='<td style="color:#4cd964">'+fmt(a2,2)+' Wh</td>';
+    }
+  }else{
+    h+='<td></td><td></td>';
+
+    if(isToday){
+      h+='<td></td>';
+    }
+  }
+
+  h+='</tr>';
+}
+
+return h+'</table>';
+}
+function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}function drawRT(){
+  let c=$('rt-canvas'),ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#111';
+  roundRect(ctx,0,0,W,H,8);
+  ctx.fill();
+
+  let all=rtS.concat(rtL);
+  let mx=Math.max(1,...all)*1.15;
+
+  // Y축 숫자를 넣기 위해 왼쪽 여백 확보
+  let p={l:34,r:4,t:10,b:10};
+  let gW=W-p.l-p.r;
+  let gH=H-p.t-p.b;
+  let n=Math.max(2,rtS.length);
+
+  ctx.font='10px -apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif';
+  ctx.textAlign='right';
+  ctx.textBaseline='middle';
+  ctx.fillStyle='rgba(255,255,255,.62)';
+  ctx.strokeStyle='#2c2c2e';
+  ctx.lineWidth=1;
+
+  // Y축 자동 범례: 최대, 75%, 50%, 25%, 0
+  for(let g=0;g<=4;g++){
+    let ratio=g/4;
+    let y=p.t+gH*ratio;
+    let val=mx*(1-ratio);
+
+    ctx.setLineDash([3,3]);
+    ctx.beginPath();
+    ctx.moveTo(p.l,y);
+    ctx.lineTo(W-p.r,y);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+    ctx.fillText(val.toFixed(1),p.l-5,y);
+  }
+
+  // Y축 단위
+  ctx.textAlign='left';
+  ctx.fillStyle='rgba(255,255,255,.50)';
+  ctx.fillText('W',4,p.t-5);
+
+  function line(data,color){
+    ctx.strokeStyle=color;
+    ctx.lineWidth=2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+
+    data.forEach((v,i)=>{
+      let x=p.l+i*(gW/(n-1));
+      let y=p.t+gH-(v/mx)*gH;
+
+      if(i===0)ctx.moveTo(x,y);
+      else ctx.lineTo(x,y);
+    });
+
+    ctx.stroke();
+  }
+
+  line(rtL,'#64d2ff');
+  line(rtS,'#ffd60a');
+
+  txt('rt-max-label','최대 '+mx.toFixed(2)+' W');
+}
+function drawBars(canvasId,pred,act,hours){
+  let c=$(canvasId),ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);
+
+  let leftPad=28;
+  let bottomPad=16;
+  let topPad=10;
+
+  let chartW=W-leftPad;
+  let chartH=H-bottomPad-topPad;
+
+  let mx=Math.max(1,...(pred||[]),...(act||[]))*1.18;
+
+  ctx.strokeStyle='#3a3a3c';
+  ctx.lineWidth=1;
+
+  ctx.beginPath();
+  ctx.moveTo(leftPad,topPad);
+  ctx.lineTo(leftPad,H-bottomPad);
+  ctx.lineTo(W,H-bottomPad);
+  ctx.stroke();
+
+  ctx.fillStyle='#8e8e93';
+  ctx.font='10px -apple-system';
+
+  for(let i=0;i<=4;i++){
+    let val=(mx*(4-i)/4).toFixed(1);
+    let y=topPad+(chartH*i/4);
+
+    ctx.fillText(Number(val).toFixed(2),2,y+3);
+
+    ctx.strokeStyle='#2c2c2e';
+    ctx.setLineDash([3,3]);
+    ctx.beginPath();
+    ctx.moveTo(leftPad,y);
+    ctx.lineTo(W,y);
+    ctx.stroke();
+  }
+
+  ctx.setLineDash([]);
+
+  let n=(hours||[]).length||13;
+  let slot=chartW/n;
+  let bw=Math.max(5,slot*.27);
+
+  for(let i=0;i<n;i++){
+    let x=leftPad+i*slot+slot*.18;
+
+    let ph=((pred||[])[i]||0)/mx*chartH;
+    let ah=((act||[])[i]||0)/mx*chartH;
+
+    ctx.fillStyle='#64d2ff';
+    roundRect(ctx,x,H-bottomPad-ph,bw,ph,2);
+    ctx.fill();
+
+    ctx.fillStyle='#30d158';
+    roundRect(ctx,x+bw+3,H-bottomPad-ah,bw,ah,2);
+    ctx.fill();
+
+    if(i%2===0){
+      ctx.fillStyle='#636366';
+      ctx.fillText(String((hours||[])[i]||'').padStart(2,'0'),x,H-2);
+    }
+  }
+
+  // 현재 시간 기준 노란 N 라인
+  let now=new Date();
+  let hour=now.getHours();
+  let minute=now.getMinutes();
+
+  if(hour>=6 && hour<=18){
+    let pos=(hour-6)+(minute/60);
+    let nx=leftPad+(pos*slot);
+
+    ctx.strokeStyle='#ffd60a';
+    ctx.lineWidth=2;
+    ctx.setLineDash([5,4]);
+
+    ctx.beginPath();
+    ctx.moveTo(nx,topPad);
+    ctx.lineTo(nx,H-bottomPad);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+
+    ctx.fillStyle='#ffd60a';
+    ctx.font='bold 11px -apple-system';
+    ctx.fillText('N',nx-4,topPad-1);
+  }
+}
+function updateForecastCards(d){[['today',d.today_gen_wh],['tomorrow',d.tomorrow_gen_wh],['after',d.after_gen_wh]].forEach(x=>{let lv=level(x[1]);txt('d-'+x[0],fmt(x[1],1));txt('b-'+x[0],lv[0]);cls('b-'+x[0],'d-badge '+lv[1])});txt('pane-today', '');$('pane-today').innerHTML=hourTable('오늘',d.hours,d.pred_hourly,d.actual_hourly);$('pane-tomorrow').innerHTML=hourTable('내일',d.hours,d.tomorrow_hourly);$('pane-after').innerHTML=hourTable('모레',d.hours,d.after_hourly);drawBars('hour-canvas',d.pred_hourly,d.actual_hourly,d.hours)}
+function addLog(d){
+  let html='';
+
+  if(d.event_logs){
+    for(let i=d.event_logs.length-1;i>=0;i--){
+      let raw=d.event_logs[i];
+      let sp=raw.split('|');
+
+      let tm=sp[0]||'--:--';
+      let msg=sp[1]||raw;
+
+      let color='#64d2ff';
+
+      if(msg.includes('외부전원')) color='#ff453a';
+      else if(msg.includes('배터리')) color='#30d158';
+      else if(msg.includes('API')) color='#a78bfa';
+      else if(msg.includes('WiFi')) color='#ffd60a';
+
+      html += `
+      <div class="log-item">
+        <div class="log-dot" style="background:${color}"></div>
+        <div>
+          <div class="log-msg">${msg}</div>
+          <div class="log-time">${tm}</div>
+        </div>
+      </div>`;
+    }
+  }
+
+  $('log-list').innerHTML=html;
+}
+async function updateData(){try{let r=await fetch('/ina',{cache:'no-store'}),d=await r.json();lastData=d;let now=new Date();if(isDesktopLayout()){
+  txt('clock',now.toLocaleTimeString('ko',{hour:'2-digit',minute:'2-digit'}));
+}else{
+  txt('clock','기상정보 기반 마이크로그리드 EMS');
+};txt('top-badge',d.ess_mode||'--');$('top-badge').style.color=d.ess_mode==='ECO'?'#ffd60a':(d.ess_mode==='MANUAL'?'#64d2ff':'#30d158');$('top-badge').style.background=d.ess_mode==='ECO'?'#3a2e00':(d.ess_mode==='MANUAL'?'#132a36':'#1c3a2e');txt('h-solar',fmt(d.solar_power,1)+' W');txt('h-batt',d.battery_percent+'%');txt('h-load',fmt(d.load_power,1)+' W');let bal=(d.solar_power||0)-(d.load_power||0);txt('h-balance',(bal>=0?'+':'')+fmt(bal,1)+' W');cls('h-balance','val '+(bal>=0?'green':'red'));txt('h-balance-sub',bal>=0?'충전 중':'방전 중');if(d.channels){txt('h-solar-sub',fmt(d.channels[0].voltage,2)+'V · '+fmt(d.channels[0].current,2)+'A');txt('h-load-sub',fmt(d.channels[2].voltage,2)+'V · '+fmt(d.channels[2].current,2)+'A');for(let i=0;i<3;i++){let c=d.channels[i];txt('ch'+i+'v',fmt(c.voltage,2)+'V');txt('ch'+i+'i',fmt(c.current,3)+'A');txt('ch'+i+'p',fmt(c.power,2)+'W');
+if(i===1){let col=Number(c.current)<0?'#ff453a':'#30d158';$('ch1i').style.color=col;$('ch1p').style.color=col;}}}txt('h-batt-ah',fmt(d.current_capacity_ah,2)+' / '+fmt(d.battery_capacity_ah,2)+' Ah');txt('bms-ah',fmt(d.current_capacity_ah,2)+' Ah');txt('bms-cap','/ '+fmt(d.battery_capacity_ah,2)+' Ah');txt('bms-soc',d.battery_percent+'%');txt('bms-eco','ECO 기준 '+d.eco_threshold+'%');txt('soc-val',d.battery_percent+'%');$('soc-bar').style.width=Math.max(0,Math.min(100,d.battery_percent))+'%';txt('ocv-val',fmt(d.battery_voltage,2)+'V');$('ocv-bar').style.width=Math.max(0,Math.min(100,(d.battery_voltage-3.0)/1.2*100))+'%';txt('solar-alt',fmt(d.solar_altitude,1)+'°');txt('solar-az',fmt(d.solar_azimuth,1)+'°');txt('shadow-val',fmt(d.shadow_factor,2));$('shadow-bar').style.width=Math.max(0,Math.min(100,d.shadow_factor*100))+'%';txt('solar-pos-time',now.toLocaleTimeString('ko',{hour:'2-digit',minute:'2-digit'}));txt('sys-wifi',d.wifi_status);txt('sys-ip',d.ip);txt('sys-sync',d.last_api_sync);txt('sys-api',d.api_status);ecoSlide(d.eco_threshold);$('eco-slider').value=d.eco_threshold;setToggle('tgl-led',d.led_load_on,false);setToggle('tgl-motor',d.motor_load_on,d.ess_mode==='ECO');setToggle('tgl-all',d.all_load_on,false);['auto','ext','bat'].forEach(x=>cls('src-'+x,'src-btn '+(d.power_mode_value===x?'active':'')));rtS.push(d.channels?d.channels[0].power:d.solar_power);rtL.push(d.channels?d.channels[2].power:d.load_power);if(rtS.length>MAXN){rtS.shift();rtL.shift()}txt('rt-timer',now.toLocaleTimeString('ko',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));drawRT();drawBars('cmp-canvas',d.pred_hourly,d.actual_hourly,d.hours);let tp=(d.pred_hourly||[]).reduce((a,b)=>a+Number(b||0),0),ta=(d.actual_hourly||[]).reduce((a,b)=>a+Number(b||0),0),er=tp>0?(ta-tp)/tp*100:0;txt('today-err','오차 '+(er>=0?'+':'')+er.toFixed(2)+'%');
+
+let nowHr=new Date().getHours();
+let idx=nowHr-6;
+let pred=0,act=0,err=0;
+
+if(idx>=0 && idx<(d.pred_hourly||[]).length){
+  pred=Number((d.pred_hourly||[])[idx]||0);
+  act=Number((d.actual_hourly||[])[idx]||0);
+  if(pred>0.01) err=((act-pred)/pred)*100;
+}
+
+txt('cur-pred',fmt(pred,2)+' Wh');
+txt('cur-actual',fmt(act,2)+' Wh');
+
+let errEl=$('cur-error');
+if(errEl){
+  errEl.textContent=(err>=0?'+':'')+fmt(err,2)+'%';
+  errEl.style.color=err>=0?'#30d158':'#ff453a';
+}
+
+updateForecastCards(d);addLog(d)}catch(e){txt('sys-wifi','통신 실패')}}
+goPage(1);updateData();setInterval(updateData,1000);let sx=0,gestureActive=false;function isInteractiveTarget(e){return e.target&&e.target.closest&&e.target.closest('input,button,.toggle,.src-btn,.sys-btn,.tab,.bni')}$('pages').addEventListener('touchstart',e=>{if(isInteractiveTarget(e)){gestureActive=false;return}gestureActive=true;sx=e.touches[0].clientX});$('pages').addEventListener('touchend',e=>{if(!gestureActive||isInteractiveTarget(e)){gestureActive=false;return}gestureActive=false;let dx=e.changedTouches[0].clientX-sx;if(Math.abs(dx)>50){if(dx<0&&curPage<2)goPage(curPage+1);else if(dx>0&&curPage>0)goPage(curPage-1)}});
+</script></body></html>)=====";
+
+void handleWebInaJson(){
+  float chV[3] = {0,0,0};
+  float chI[3] = {0,0,0};
+  float chP[3] = {0,0,0};
+
+  if(ina3221OK){
+    for(uint8_t i=0;i<3;i++){
+      chV[i] = ina3221.getBusVoltage(i);
+      chI[i] = ina3221.getCurrentAmps(i);
+      chP[i] = chV[i] * fabs(chI[i]);
+    }
+  }
+
+  float totalActual=currentSlotAccumWh;
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++) totalActual+=actualHourlyWh[i];
+
+  float solarAlt = 0.0f;
+  float solarAz = 0.0f;
+  float shadowFactor = 0.0f;
+  struct tm ti;
+  if(getLocalTime(&ti)){
+    float hourUTC = (float)ti.tm_hour - 9.0f + (float)ti.tm_min/60.0f + (float)ti.tm_sec/3600.0f;
+    SolarPos sp = calcSolarPosition(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, hourUTC);
+    solarAlt = sp.altitude;
+    solarAz = sp.azimuth;
+    shadowFactor = calcShadowFactor(sp.altitude);
+  }
+
+  String json;
+  json.reserve(3400);
+  json += "{";
+  json += "\"ina_ok\":"; json += (ina3221OK ? "true" : "false"); json += ",";
+  json += "\"web_ok\":"; json += ((webServerReady && WiFi.status()==WL_CONNECTED) ? "true" : "false"); json += ",";
+  json += "\"uptime_ms\":"; json += String(millis()); json += ",";
+  json += "\"wifi_status\":\""; json += jsonEscape(wifiStatus); json += "\",";
+  json += "\"ip\":\""; json += (WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():String("---")); json += "\",";
+  json += "\"api_status\":\""; json += jsonEscape(apiStatus); json += "\",";
+  json += "\"last_api_sync\":\""; json += jsonEscape(lastApiSync); json += "\",";
+  json += "\"battery_percent\":"; json += String(batteryPercent); json += ",";
+  json += "\"battery_voltage\":"; json += String(batteryVoltage,3); json += ",";
+  json += "\"battery_current\":"; json += String(batteryCurrent,4); json += ",";
+  json += "\"current_capacity_ah\":"; json += String(currentCapacityAh,3); json += ",";
+  json += "\"battery_capacity_ah\":"; json += String(BATTERY_CAPACITY_AH,3); json += ",";
+  json += "\"eco_threshold\":"; json += String(ecoModeThresholdPercent); json += ",";
+  json += "\"ess_mode\":\""; json += jsonEscape(essMode); json += "\",";
+  json += "\"power_mode\":\""; json += powerSourceModeText(); json += "\",";
+  json += "\"power_mode_value\":\""; json += powerSourceModeValue(); json += "\",";
+  json += "\"active_source\":\""; json += activePowerSourceText(); json += "\",";
+  json += "\"solar_power\":"; json += String(solarPower,2); json += ",";
+  json += "\"load_power\":"; json += String(loadPower,2); json += ",";
+  json += "\"today_gen_wh\":"; json += String(todayGenWh,2); json += ",";
+  json += "\"tomorrow_gen_wh\":"; json += String(tomorrowGenWh,2); json += ",";
+  json += "\"after_gen_wh\":"; json += String(afterTomorrowGenWh,2); json += ",";
+  json += "\"total_actual_wh\":"; json += String(totalActual,2); json += ",";
+  json += "\"solar_altitude\":"; json += String(solarAlt,2); json += ",";
+  json += "\"solar_azimuth\":"; json += String(solarAz,2); json += ",";
+  json += "\"shadow_factor\":"; json += String(shadowFactor,2); json += ",";
+  json += "\"all_load_on\":"; json += (allLoadOn ? "true" : "false"); json += ",";
+  json += "\"motor_load_on\":"; json += (motorLoadOn ? "true" : "false"); json += ",";
+  json += "\"led_load_on\":"; json += (ledLoadOn ? "true" : "false"); json += ",";
+  json += "\"hours\":[";
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){ if(i>0) json += ","; json += String(SOLAR_SLOT_START_HOUR+i); }
+  json += "],\"pred_hourly\":[";
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){ if(i>0) json += ","; json += String(todayHourlyGenWh[i],2); }
+  json += "],\"tomorrow_hourly\":[";
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){ if(i>0) json += ","; json += String(tomorrowHourlyGenWh[i],2); }
+  json += "],\"after_hourly\":[";
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){ if(i>0) json += ","; json += String(afterTomorrowHourlyGenWh[i],2); }
+  json += "],\"actual_hourly\":[";
+  int nh=-1; if(getLocalTime(&ti)) nh=ti.tm_hour;
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){
+    if(i>0) json += ",";
+    int sh=SOLAR_SLOT_START_HOUR+i;
+    float aw=(sh==nh)?currentSlotAccumWh:actualHourlyWh[i];
+    json += String(aw,2);
+  }
+  json += "],\"channels\":[";
+  const char* names[3] = {"CH1 Solar", "CH2 Battery", "CH3 Load"};
+  for(uint8_t i=0;i<3;i++){
+    if(i>0) json += ",";
+    json += "{";
+    json += "\"name\":\""; json += names[i]; json += "\",";
+    appendJsonFloat(json, "voltage", chV[i], 3); json += ",";
+    appendJsonFloat(json, "current", chI[i], 4); json += ",";
+    appendJsonFloat(json, "power", chP[i], 3);
+    json += "}";
+  }
+  json += "],\"event_logs\":[";
+
+for(int i=0;i<eventLogCount;i++){
+  if(i>0) json += ",";
+  json += "\"" + jsonEscape(eventLogs[i]) + "\"";
+}
+
+json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleWebRoot(){
+  server.send_P(200, "text/html", WEB_INDEX);
+}
+
+void handleWebSetEco(){
+  if(server.hasArg("value")){
+    int newThreshold = constrain(server.arg("value").toInt(), 5, 95);
+
+    if(newThreshold != ecoModeThresholdPercent){
+      ecoModeThresholdPercent = newThreshold;
+      saveEcoThresholdToNVS();
+      addEventLog("ECO 기준 저장 " + String(ecoModeThresholdPercent) + "%");
+    }
+
+    updateEssModeByBatteryAndForecast();
+  }
+
+  // AJAX 요청은 현재 웹앱 화면을 유지해야 하므로 절대 홈(/)으로 리다이렉트하지 않는다.
+  if(server.hasArg("ajax")){
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.sendHeader("Location", "/");
+    server.send(303);
+  }
+}
+
+void handleWebSetSource(){
+  String m = server.arg("mode");
+  if(m=="ext")      powerSourceMode = POWER_SOURCE_FORCE_EXTERNAL;
+  else if(m=="bat") powerSourceMode = POWER_SOURCE_FORCE_BATTERY;
+  else               powerSourceMode = POWER_SOURCE_AUTO;
+
+  if(powerSourceMode==POWER_SOURCE_AUTO) updateEssModeByBatteryAndForecast();
+  else applyEssModeOutputs();
+
+  if(currentPage==PAGE_LOAD) drawLoadControlPage();
+  if(currentPage==PAGE_MAIN) updateMainDynamicValues();
+
+  if(server.hasArg("ajax")) server.send(200,"text/plain","OK");
+  else { server.sendHeader("Location","/"); server.send(303); }
+}
+
+void handleWebSetLoad(){
+  String target = server.arg("target");
+  String value  = server.arg("value");
+
+  if(target=="all"){
+    bool t = (value=="on") ? true : (value=="off") ? false : !allLoadOn;
+    motorLoadOn = isEcoModeActive() ? false : t;
+    ledLoadOn = t;
+  } else if(target=="motor"){
+    if(!shouldForceMotorOff()){
+      if(value=="on") motorLoadOn = true;
+      else if(value=="off") motorLoadOn = false;
+      else motorLoadOn = !motorLoadOn;
+    }
+  } else if(target=="led"){
+    if(value=="on") ledLoadOn = true;
+    else if(value=="off") ledLoadOn = false;
+    else ledLoadOn = !ledLoadOn;
+  }
+  applyLoadOutputs();
+  if(currentPage==PAGE_LOAD) drawLoadControlPage();
+  if(currentPage==PAGE_MAIN) updateMainDynamicValues();
+  if(server.hasArg("ajax")) server.send(200,"text/plain","OK");
+  else { server.sendHeader("Location","/"); server.send(303); }
+}
+
+void handleWebWifiReconnect(){
+  doWifiReconnect();
+  if(server.hasArg("ajax")) server.send(200,"text/plain","OK");
+  else { server.sendHeader("Location","/"); server.send(303); }
+}
+
+void handleWebApiRefresh(){
+  doApiRefresh();
+  if(server.hasArg("ajax")) server.send(200,"text/plain","OK");
+  else { server.sendHeader("Location","/"); server.send(303); }
+}
+
+void handleWebNotFound(){
+  server.send(404,"text/plain","Not found");
+}
+
+void setupWebServer(){
+  server.on("/", handleWebRoot);
+  server.on("/ina", handleWebInaJson);
+  server.on("/setEco", handleWebSetEco);
+  server.on("/source", handleWebSetSource);
+  server.on("/load", handleWebSetLoad);
+  server.on("/wifiReconnect", handleWebWifiReconnect);
+  server.on("/apiRefresh", handleWebApiRefresh);
+  server.onNotFound(handleWebNotFound);
+  server.begin();
+  webServerReady = true;
+  Serial.println("[WEB] iPhone-style server started on port 80");
+}
+
+// ================= SYSTEM PAGE =================
+void drawSystemPage(){
+  tft.fillScreen(C_BG);
+  drawHeader("SYSTEM");
+
+  // Row1: WiFi
+  drawCard(4,40,312,34);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(10,47); tft.print("WiFi");
+  tft.setTextSize(2);
+  if(wifiStatus=="CONNECTED")       tft.setTextColor(C_GREEN,C_CARD);
+  else if(wifiStatus=="CONNECTING") tft.setTextColor(C_YELLOW,C_CARD);
+  else if(wifiStatus=="---")        tft.setTextColor(C_GRAY,C_CARD);
+  else                              tft.setTextColor(C_RED,C_CARD);
+  tft.setCursor(55,45); tft.print(wifiStatus);
+
+  // Row2: Date/Time
+  drawCard(4,78,312,34);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(10,85); tft.print("Date/Time");
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(90,83);
+  String dtText = getDateTimeString();
+  if(dtText == "TIME FAIL") dtText = "--/-- --:--";
+  tft.print(dtText);
+
+  // Row3: API Sync
+  drawCard(4,116,312,34);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(10,123); tft.print("API Sync");
+  tft.setTextSize(2); tft.setTextColor(C_YELLOW,C_CARD); tft.setCursor(90,121); tft.print(lastApiSync);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(160,123); tft.print(apiStatus);
+
+  // Row4: IP + Web server status
+  drawCard(4,154,312,34);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(10,161); tft.print("IP");
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(40,159);
+  bool webOk = (WiFi.status()==WL_CONNECTED && webServerReady);
+  if(WiFi.status()==WL_CONNECTED) tft.print(WiFi.localIP());
+  else                             tft.print("---");
+  tft.setTextSize(1);
+  tft.setTextColor(webOk ? C_GREEN : C_RED, C_CARD);
+  tft.setCursor(250,163);
+  tft.print(webOk ? "(OK)" : "(Fail)");
+
+  // Row5: 버튼
+  bool wifiCanReconnect=(WiFi.status()!=WL_CONNECTED && wifiStatus!="CONNECTING" && wifiStatus!="---" && !initialApiTaskRunning);
+  uint16_t wBtnC=wifiCanReconnect?C_YELLOW:C_GRAY;
+  tft.fillRoundRect(4,193,152,40,8,C_CARD);
+  tft.drawRoundRect(4,193,152,40,8,wBtnC);
+  tft.setTextColor(wBtnC,C_CARD); tft.setTextSize(1);
+  tft.setCursor(12,207); tft.print("WiFi Reconnect");
+
+  bool apiCanRefresh=(WiFi.status()==WL_CONNECTED&&!initialApiTaskRunning);
+  uint16_t aBtnC=apiCanRefresh?C_CYAN:C_GRAY;
+  tft.fillRoundRect(160,193,156,40,8,C_CARD);
+  tft.drawRoundRect(160,193,156,40,8,aBtnC);
+  tft.setTextColor(aBtnC,C_CARD); tft.setTextSize(1);
+  tft.setCursor(168,207); tft.print("API Refresh");
+}
+
+// [수정] 시스템 페이지 시간 부분만 업데이트 (1분마다 호출 → 깜빡임 없음)
+void updateSystemPageTimeOnly(){
+  // Row2 시간 부분만 업데이트한다. 같은 값이면 다시 그리지 않아 시간 동기화 중 깜빡임을 줄인다.
+  static String lastDtText = "";
+  String dtText = getDateTimeString();
+  if(dtText == "TIME FAIL") dtText = "--/-- --:--";
+  if(dtText == lastDtText) return;
+  lastDtText = dtText;
+
+  tft.fillRect(90,83,222,18,C_CARD);
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(90,83);
+  tft.print(dtText);
+}
+
+// [수정] 시스템 페이지 API Sync 부분만 업데이트
+void updateSystemPageApiSync(){
+  tft.fillRect(90,121,220,16,C_CARD);
+  tft.setTextSize(2); tft.setTextColor(C_YELLOW,C_CARD); tft.setCursor(90,121); tft.print(lastApiSync);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_CARD); tft.setCursor(160,123); tft.print(apiStatus);
+}
+
+// ================= FORECAST PAGE =================
+float maxForecastWh(){
+  // 절대 스케일 사용 (0~60Wh 기준)
+  return 60.0f;
+}
+float minForecastWh(){
+  return 0.0f;
+}
+uint16_t genColor(float w){if(w<18)return C_RED;if(w<36)return C_YELLOW;return C_GREEN;}
+const char* genLevelText(float w){if(w<18)return "LOW";if(w<36)return "NORMAL";return "HIGH";}
+void drawWhBar(int x,int y,float wh,const char*label,float mn,float mx){
+  wh=constrain(wh,0,100); uint16_t c=genColor(wh);
+  tft.setTextSize(2); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(x,y); tft.print(label);
+  const int bx=x+110, bm=102, vx=x+218;
+  tft.drawRect(bx,y,bm+2,16,C_LINE);
+  int bw=0;
+  if(mx>mn+0.1f)bw=map((int)(wh*10),(int)(mn*10),(int)(mx*10),8,bm);
+  else bw=(wh>0.1f)?bm:0;
+  bw=constrain(bw,0,bm);
+  tft.fillRect(bx+1,y+1,bw,14,c);
+  tft.setTextColor(c,C_CARD); tft.setCursor(vx,y); tft.print(wh,1); tft.print("Wh");
+  tft.setTextSize(1); tft.setTextColor(c,C_CARD); tft.setCursor(bx,y+19); tft.print(genLevelText(wh));
+}
+void drawForecastPage(){
+  tft.fillScreen(C_BG); drawHeader("FORECAST");
+  tft.setTextSize(2); tft.setTextColor(C_YELLOW,C_BG); tft.setCursor(18,50); tft.print("Solar Gen Fcst");
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_BG); tft.setCursor(18,72); tft.print(apiStatus);
+  drawCard(10,90,300,120);
+  float mn=minForecastWh(), mx=maxForecastWh();
+  drawWhBar(20,105,todayGenWh,"Today",mn,mx);
+  drawWhBar(20,140,tomorrowGenWh,"Tomorrow",mn,mx);
+  drawWhBar(20,175,afterTomorrowGenWh,"After",mn,mx);
+}
+
+// ================= COMPARE PAGE =================
+void drawComparePage(){
+  tft.fillScreen(C_BG); drawHeader("COMPARE");
+  float totalActual=currentSlotAccumWh;
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++) totalActual+=actualHourlyWh[i];
+  float errorRate=0;
+  if(todayGenWh>0.1f) errorRate=(totalActual-todayGenWh)/todayGenWh*100.0f;
+
+  tft.drawRoundRect(4,42,98,44,6,C_CYAN); tft.fillRoundRect(5,43,96,42,6,C_CARD);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(12,50); tft.print("Today Fcst");
+  tft.setTextSize(2); tft.setTextColor(C_CYAN,C_CARD); tft.setCursor(8,62); tft.print(todayGenWh,1);
+  tft.setTextSize(1); tft.print("Wh");
+
+  tft.drawRoundRect(108,42,98,44,6,C_GREEN); tft.fillRoundRect(109,43,96,42,6,C_CARD);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(116,50); tft.print("Today Act");
+  tft.setTextSize(2); tft.setTextColor(C_GREEN,C_CARD); tft.setCursor(112,62); tft.print(totalActual,1);
+  tft.setTextSize(1); tft.print("Wh");
+
+  uint16_t ec=errorRate>=0?C_GREEN:C_RED;
+  tft.drawRoundRect(212,42,104,44,6,ec); tft.fillRoundRect(213,43,102,42,6,C_CARD);
+  tft.setTextSize(1); tft.setTextColor(C_WHITE,C_CARD); tft.setCursor(222,50); tft.print("Error Rate");
+  tft.setTextSize(2); tft.setTextColor(ec,C_CARD); tft.setCursor(216,62);
+  if(errorRate>0)tft.print("+"); tft.print(errorRate,1); tft.setTextSize(1); tft.print("%");
+
+  // [수정] 범례를 우측(x=220)으로 이동 → NOW 글씨와 겹침 방지
+  tft.setTextSize(1); tft.setTextColor(C_YELLOW,C_BG); tft.setCursor(38,92); tft.print("Wh");
+  tft.fillRect(232,90,8,8,C_CYAN);  tft.setTextColor(C_WHITE,C_BG); tft.setCursor(242,91); tft.print("Pred");
+  tft.fillRect(272,90,8,8,C_GREEN); tft.setCursor(282,91); tft.print("Act");
+
+  const int CHART_X=34,CHART_Y=104,CHART_H=112,CHART_BOT=CHART_Y+CHART_H;
+  const int SLOT_W=(282/SOLAR_SLOT_COUNT);
+  const int BAR_W=max(6, min(8, (SLOT_W-4)/2));
+  float maxWh=1.0f;
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){
+    if(todayHourlyGenWh[i]>maxWh) maxWh=todayHourlyGenWh[i];
+    if(actualHourlyWh[i]>maxWh)   maxWh=actualHourlyWh[i];
+  }
+  if(currentSlotAccumWh>maxWh) maxWh=currentSlotAccumWh;
+  maxWh*=1.15f;
+
+  tft.drawLine(CHART_X-1,CHART_Y,CHART_X-1,CHART_BOT,C_GRAY);
+  tft.drawLine(CHART_X-1,CHART_BOT,CHART_X+SLOT_W*SOLAR_SLOT_COUNT,CHART_BOT,C_GRAY);
+  tft.setTextSize(1); tft.setTextColor(C_GRAY,C_BG);
+  char yLab[10];
+  dtostrf(maxWh/1.15f,4,1,yLab);
+  tft.setCursor(1,CHART_Y); tft.print(yLab);
+  tft.drawLine(CHART_X-3,CHART_Y,CHART_X-1,CHART_Y,C_GRAY);
+  dtostrf((maxWh/1.15f)/2.0f,4,1,yLab);
+  tft.setCursor(1,CHART_Y+CHART_H/2-4); tft.print(yLab);
+  tft.drawLine(CHART_X-3,CHART_Y+CHART_H/2,CHART_X-1,CHART_Y+CHART_H/2,C_GRAY);
+  for(int dx=CHART_X;dx<CHART_X+SLOT_W*SOLAR_SLOT_COUNT;dx+=4)
+    tft.drawPixel(dx,CHART_Y+CHART_H/2,0x2945);
+  tft.setCursor(1,CHART_BOT-8); tft.print("0.0");
+  tft.drawLine(CHART_X-3,CHART_BOT,CHART_X-1,CHART_BOT,C_GRAY);
+
+  struct tm ti; int nh=14,nm=0;
+  if(getLocalTime(&ti)){nh=ti.tm_hour;nm=ti.tm_min;}
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){
+    int sh=SOLAR_SLOT_START_HOUR+i, bx=CHART_X+i*SLOT_W;
+    float pw=todayHourlyGenWh[i];
+    if(pw>0&&maxWh>0){int bh=constrain((int)(pw/maxWh*(CHART_H-1)),1,CHART_H-1);tft.fillRect(bx+1,CHART_BOT-bh,BAR_W,bh,C_CYAN);}
+    float aw=0;
+    if(sh<nh) aw=actualHourlyWh[i]; else if(sh==nh) aw=currentSlotAccumWh;
+    if(aw>0&&maxWh>0){int bh=constrain((int)(aw/maxWh*(CHART_H-1)),1,CHART_H-1);tft.fillRect(bx+1+BAR_W+2,CHART_BOT-bh,BAR_W,bh,C_GREEN);}
+    if(sh%2==0){tft.setTextSize(1);tft.setTextColor(C_GRAY,C_BG);tft.setCursor(bx+(sh<10?4:1),CHART_BOT+3);tft.print(sh);}
+  }
+  if(nh>=SOLAR_SLOT_START_HOUR&&nh<=SOLAR_SLOT_END_HOUR){
+    float fh=(float)(nh-SOLAR_SLOT_START_HOUR)+nm/60.0f;
+    int nx=constrain(CHART_X+(int)(fh*SLOT_W),CHART_X,CHART_X+SLOT_W*SOLAR_SLOT_COUNT-1);
+    for(int dy=CHART_Y;dy<CHART_BOT;dy++) if((dy/2)%2==0) tft.drawPixel(nx,dy,C_YELLOW);
+    tft.setTextSize(1); tft.setTextColor(C_YELLOW,C_BG);
+    // NOW 텍스트: 그래프 하단(CHART_BOT 아래)에 표시하여 범례와 겹침 방지
+    int lx=constrain(nx-8,CHART_X,CHART_X+SLOT_W*SOLAR_SLOT_COUNT-22);
+    tft.setCursor(lx,CHART_BOT+3); tft.print("N");
+  }
+}
+
+// ================= PAGE CONTROL =================
+void drawPage(){
+  switch(currentPage){
+    case PAGE_SYSTEM:   drawSystemPage();      break;
+    case PAGE_LOAD:     drawLoadControlPage(); break;
+    case PAGE_MAIN:     drawMainPage();        break;
+    case PAGE_COMPARE:  drawComparePage();     break;
+    case PAGE_FORECAST: drawForecastPage();    break;
+  }
+}
+void nextPage(){currentPage++;if(currentPage>PAGE_MAX)currentPage=PAGE_MIN;drawPage();}
+void prevPage(){currentPage--;if(currentPage<PAGE_MIN)currentPage=PAGE_MAX;drawPage();}
+
+// ================= TOUCH =================
+int rawToScreenX(TS_Point p){return constrain(map(p.y,200,3900,0,320),0,319);}  // 터치 좌우 방향 원래대로 복원
+int rawToScreenY(TS_Point p){return constrain(map(p.x,200,3900,240,0),0,239);}
+
+// WiFi 재연결 버튼 실행
+void doWifiReconnect(){
+  connectWiFi();
+  if(WiFi.status()==WL_CONNECTED){
+    wifiDisconnectedAlert=false;
+    lastWifiConnectedState=true;
+    
+    // 재연결 버튼은 WiFi 연결만 수행한다. API는 사용자가 API Refresh 버튼으로 직접 실행한다.
+    updateEssModeByTomorrowForecast();
+    if(currentPage==PAGE_SYSTEM) drawSystemPage();
+  }
+}
+
+// API 새로고침 버튼 실행
+void doApiRefresh(){
+  if(WiFi.status()!=WL_CONNECTED||initialApiTaskRunning) return;
+
+  initialApiTaskRunning=true;
+
+  // API 새로고침도 시간 기준이 필요하므로 먼저 NTP 시간 동기화를 확인한다.
+  trafficLedMode=LED_MODE_TIME_SYNC;
+  trafficLedLastToggle = 0;
+  trafficLedBlinkState = false;
+  apiStatus="API: TIME SYNC";
+  if(currentPage==PAGE_SYSTEM) drawSystemPage();
+
+  bool tok = ensureTimeSyncedForApi(20000);
+  if(currentPage==PAGE_SYSTEM) updateSystemPageTimeOnly();
+  if(!tok){
+    apiStatus="API: TIME FAIL";
+    initialApiTaskRunning=false;
+    trafficLedMode=LED_MODE_API_FAILED;
+    if(currentPage==PAGE_SYSTEM) drawSystemPage();
+    return;
+  }
+
+  trafficLedMode=LED_MODE_API_LOADING;
+  startApiLedHwTimer();              // HW 타이머로 LED 전체 점멸 시작
+  apiStatus="API: CALLING";
+  if(currentPage==PAGE_SYSTEM) updateSystemPageApiSync();
+  fetchKmaForecastWithRetry(3, 7000);
+  stopApiLedHwTimer();               // LED 점멸 중지
+  initialKmaFetched=true;
+  initialApiTaskRunning=false;
+  if(isApiForecastOk()){
+    loadActualDataFromNVS();
+    updateEssModeByTomorrowForecast();
+    // LED를 ESS 모드에 맞게 재설정
+    trafficLedMode=isEcoModeActive()?LED_MODE_ESS_ECO:LED_MODE_ESS_NORMAL;
+    updateEssSourceLeds();
+  } else {
+    trafficLedMode=LED_MODE_API_FAILED;
+    setTrafficLeds(false,false,false);
+  }
+  lastApiSync=getTimeOnlyString();
+  if(currentPage==PAGE_SYSTEM) drawSystemPage();
+}
+
+void handleSystemTap(int x,int y){
+  Serial.printf("[SysTap] x=%d y=%d\n",x,y);
+
+  // WiFi 재연결 버튼 영역: x=4~156, y=193~233
+  if(pointInRect(x,y,4,193,152,40)){
+    Serial.println("[SysTap] WiFi Reconnect btn");
+    if(wifiStatus=="CONNECTING"||WiFi.status()==WL_CONNECTED){
+      Serial.println("[SysTap] already connected/connecting, skip");
+      return;
+    }
+    doWifiReconnect();
+    return;
+  }
+  // API 새로고침 버튼 영역: x=160~316, y=193~233
+  if(pointInRect(x,y,160,193,156,40)){
+    Serial.println("[SysTap] API Refresh btn");
+    doApiRefresh();
+    return;
+  }
+}
+
+// [수정] 스와이프/화살표 방향
+// 좌→우 스와이프(dx>0) = prevPage(왼쪽 페이지)
+// 우→좌 스와이프(dx<0) = nextPage(오른쪽 페이지)
+// < 화살표(lx<=35) = prevPage,  > 화살표(lx>=285) = nextPage
+// ※ 하드웨어에서 반대로 동작하는 경우 아래 nextPage/prevPage를 교체
+void handleTouch(){
+  static int lx=0, ly=0;
+  if(ts.touched()){
+    TS_Point p=ts.getPoint();
+    int sx=rawToScreenX(p), sy=rawToScreenY(p);
+    if(!touching){touching=true;startX=sx;startY=sy;}
+    lx=sx; ly=sy;
+  } else {
+    if(touching){
+      int dx=lx-startX, dy=ly-startY;
+      if(abs(dx)>55&&abs(dx)>abs(dy)*1.4f){
+        // 스와이프: 오른쪽(dx>0)=이전 페이지, 왼쪽(dx<0)=다음 페이지
+        if(dx>0) prevPage(); else nextPage();
+      } else if(abs(dx)<50&&abs(dy)<50){
+        if(ly<=36){
+          // 화살표: 좌(<)=이전 페이지, 우(>)=다음 페이지
+          if(lx<=35)       prevPage();
+          else if(lx>=285) nextPage();
+        } else if(currentPage==PAGE_LOAD)    handleLoadControlTap(lx,ly);
+          else if(currentPage==PAGE_SYSTEM)  handleSystemTap(lx,ly);
+      }
+      touching=false;
+    }
+  }
+}
+
+// ================= WIFI =================
+void connectWiFi(){
+  wifiStatus="CONNECTING";
+  trafficLedMode=LED_MODE_WIFI_CONNECTING;
+  trafficLedLastToggle=millis();
+  trafficLedBlinkState=false;
+
+  // 연결 시도 시작: 빨강/초록은 끄고 노란색만 점멸
+  setTrafficLeds(false,false,false);
+  drawSystemPage();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(300);
+
+  WiFi.begin(WIFI_SSID,WIFI_PASS);
+
+  unsigned long sm=millis();
+  unsigned long lastBlinkMs=0;
+  bool yBlink=false;
+
+  while(WiFi.status()!=WL_CONNECTED && millis()-sm<10000UL){
+    // WiFi 연결 중에는 다른 LED 상태 함수에 의존하지 않고 노란색 LED를 직접 점멸
+    if(millis()-lastBlinkMs>=250UL){
+      lastBlinkMs=millis();
+      yBlink=!yBlink;
+      digitalWrite(TRAFFIC_LED_R_PIN,LOW);
+      digitalWrite(TRAFFIC_LED_Y_PIN,yBlink?HIGH:LOW);
+      digitalWrite(TRAFFIC_LED_G_PIN,LOW);
+    }
+    delay(20);
+  }
+
+  if(WiFi.status()==WL_CONNECTED){
+    wifiStatus="CONNECTED";
+    addEventLog("WiFi 연결 성공");
+    wifiDisconnectedAlert=false;
+    lastWifiConnectedState=true;
+    trafficLedMode=LED_MODE_WIFI_CONNECTED;
+
+    // 연결 성공: 노란색 OFF, 초록색 ON
+    setTrafficLeds(false,false,true);
+
+    if(!webServerReady) setupWebServer();
+    Serial.printf("WiFi OK IP:%s\n",WiFi.localIP().toString().c_str());
+  } else {
+    wifiStatus="FAIL";
+    wifiDisconnectedAlert=false;
+    lastWifiConnectedState=false;
+    trafficLedMode=LED_MODE_WIFI_FAILED;
+
+    // 실패 시 일단 모두 OFF, 이후 loop에서 실패 표시 점멸
+    setTrafficLeds(false,false,false);
+    Serial.println("WiFi FAILED");
+  }
+
+  drawSystemPage();
+}
+
+// ================= 태양 위치 =================
+SolarPos calcSolarPosition(int year,int month,int day,float hourUTC){
+  float A=floor((14.0f-month)/12.0f),Y=year+4800.0f-A,M=month+12.0f*A-3.0f;
+  float JD=day+floor((153.0f*M+2.0f)/5.0f)+365.0f*Y+floor(Y/4.0f)
+           -floor(Y/100.0f)+floor(Y/400.0f)-32045.0f+hourUTC/24.0f-0.5f;
+  float n=JD-2451545.0f;
+  float L=fmod(280.460f+0.9856474f*n,360.0f);
+  float g=fmod(357.528f+0.9856003f*n,360.0f);
+  float gr=g*DEG_TO_RAD;
+  float lam=L+1.915f*sin(gr)+0.020f*sin(2.0f*gr);
+  float ep=23.439f-0.0000004f*n;
+  float lamR=lam*DEG_TO_RAD, epR=ep*DEG_TO_RAD;
+  float decl=asin(sin(epR)*sin(lamR));
+  float B=(360.0f/365.0f)*(n-81.0f)*DEG_TO_RAD;
+  float EoT=9.87f*sin(2.0f*B)-7.53f*cos(B)-1.5f*sin(B);
+  float st=hourUTC+LONGITUDE_DEG/15.0f+EoT/60.0f;
+  float HRA=(st-12.0f)*15.0f, HRAR=HRA*DEG_TO_RAD, latR=LATITUDE_DEG*DEG_TO_RAD;
+  float sinAlt=sin(latR)*sin(decl)+cos(latR)*cos(decl)*cos(HRAR);
+  float alt=asin(sinAlt)*RAD_TO_DEG;
+  float cosAz=constrain((sin(decl)-sin(latR)*sinAlt)/(cos(latR)*cos(alt*DEG_TO_RAD)),-1.0f,1.0f);
+  float az=acos(cosAz)*RAD_TO_DEG;
+  if(sin(HRAR)>0) az=-az;
+  return {alt, az};
+}
+float calcCosIncidenceAngle(float ad,float sd,float td,float pd){
+  float aR=ad*DEG_TO_RAD,sR=sd*DEG_TO_RAD,tR=td*DEG_TO_RAD,pR=pd*DEG_TO_RAD;
+  float sx=cos(aR)*sin(sR),sy=cos(aR)*cos(sR),sz=sin(aR);
+  float nx=sin(tR)*sin(pR),ny=sin(tR)*cos(pR),nz=cos(tR);
+  return constrain(sx*nx+sy*ny+sz*nz,0.0f,1.0f);
+}
+float calcAirMass(float a){
+  if(a<=0)return 99.0f;
+  float r=a*DEG_TO_RAD;
+  return constrain(1.0f/(sin(r)+0.50572f*pow(a+6.07995f,-1.6364f)),1.0f,40.0f);
+}
+IrradComp calcDNI_DHI(float a,float h){
+  if(a<=0)return{0,0};
+  float AM=calcAirMass(a),hf=1.0f;
+  if(h>60.0f)hf=constrain(1.0f-(h-60.0f)*0.003f,0.7f,1.0f);
+  float DNI=1361.0f*pow(0.7f*hf,AM);
+  return{DNI,DNI*0.10f};
+}
+float calcPOA(float D,float H,float c,float t){
+  float tr=t*DEG_TO_RAD;
+  return constrain(D*c+H*(1.0f+cos(tr))/2.0f,0.0f,1400.0f);
+}
+float calcCellTemp(float T,float G){return T+G*(NOCT-20.0f)/800.0f;}
+float calcShadowFactor(float a){
+  if(a<=0)return 0.5f;
+  if(a>=SHADOW_ALTITUDE_THRESH_DEG)return 1.0f;
+  return 0.5f+0.5f*(a/SHADOW_ALTITUDE_THRESH_DEG);
+}
+float skyToSunFactor(int s){
+  if(s==1)return 1.0f; if(s==3)return 0.6f; if(s==4)return 0.25f; return 0.5f;
+}
+float estimateDailyWhAdvanced(const String&ds,int*sky,int*pop,int*reh,float*tmp,bool*sv,int sc,float*hOut=NULL){
+  if(hOut) for(int i=0;i<SOLAR_SLOT_COUNT;i++) hOut[i]=0;
+  if(sc==0) return 0;
+  int yr=ds.substring(0,4).toInt(),mo=ds.substring(4,6).toInt(),dy=ds.substring(6,8).toInt();
+  float tw=0, tp=PANEL_PEAK_W*PANEL_COUNT;
+  for(int si=0;si<SOLAR_SLOT_COUNT;si++){
+    int kst=SOLAR_SLOT_START_HOUR+si;
+    if(!sv[si]) continue;
+    float uh=kst-9.0f;
+    SolarPos sp=calcSolarPosition(yr,mo,dy,uh);
+    if(sp.altitude<=0) continue;
+    float ci=calcCosIncidenceAngle(sp.altitude,sp.azimuth,PANEL_TILT_DEG,PANEL_AZIMUTH_DEG);
+    IrradComp ir=calcDNI_DHI(sp.altitude,(float)reh[si]);
+    float wf=skyToSunFactor(sky[si])*constrain(1.0f-pop[si]/200.0f,0.3f,1.0f);
+    ir.DNI*=wf; ir.DHI*=wf;
+    float poa=calcPOA(ir.DNI,ir.DHI,ci,PANEL_TILT_DEG);
+    float tl=constrain(1.0f+TEMP_COEFF_PER_C*(calcCellTemp(tmp[si],poa)-25.0f),0.7f,1.1f);
+    float wh=constrain(tp*(poa/1000.0f)*tl*calcShadowFactor(sp.altitude)*SYSTEM_EFFICIENCY,0.0f,tp);
+    tw+=wh; if(hOut) hOut[si]=wh;
+  }
+  Serial.printf("  Daily total: %.2fWh\n",tw);
+  return tw;
+}
+
+// ================= KMA 파싱 =================
+String extractJsonStringValue(const String&o,const char*k){
+  String p="\""+String(k)+"\":\"";
+  int s=o.indexOf(p); if(s<0)return "";
+  s+=p.length(); int e=o.indexOf("\"",s); if(e<0)return "";
+  return o.substring(s,e);
+}
+void initForecastData(DayForecastData d[3]){
+  for(int i=0;i<3;i++){
+    for(int j=0;j<SOLAR_SLOT_COUNT;j++){
+      d[i].skySlots[j]=1;d[i].popSlots[j]=0;
+      d[i].rehSlots[j]=50;d[i].tempSlots[j]=15;d[i].slotValid[j]=false;
+    }
+    d[i].slotCount=0;
+  }
+}
+void copyOneSlot(DayForecastData d[3],DayForecastData s[3],int di,int si){
+  if(di<0||di>=3||si<0||si>=SOLAR_SLOT_COUNT||!s[di].slotValid[si])return;
+  bool w=d[di].slotValid[si];
+  d[di].skySlots[si]=s[di].skySlots[si]; d[di].popSlots[si]=s[di].popSlots[si];
+  d[di].rehSlots[si]=s[di].rehSlots[si]; d[di].tempSlots[si]=s[di].tempSlots[si];
+  d[di].slotValid[si]=true; if(!w)d[di].slotCount++;
+}
+void copyDayAllSlots(DayForecastData d[3],DayForecastData s[3],int di){
+  for(int si=0;si<SOLAR_SLOT_COUNT;si++) copyOneSlot(d,s,di,si);
+}
+void parseKmaItemsAdvancedAppend(const String&pl,String dt[3],DayForecastData da[3]){
+  int pos=0;
+  while(true){
+    int kp=pl.indexOf("\"baseDate\"",pos); if(kp<0)break;
+    int is=pl.lastIndexOf("{",kp); if(is<0)break;
+    int ie=pl.indexOf("}",kp); if(ie<0)break;
+    String obj=pl.substring(is,ie+1); pos=ie+1;
+    String cat=extractJsonStringValue(obj,"category");
+    if(cat!="SKY"&&cat!="POP"&&cat!="REH"&&cat!="TMP") continue;
+    String fd=extractJsonStringValue(obj,"fcstDate");
+    String ft=extractJsonStringValue(obj,"fcstTime");
+    if(ft.length()<4) continue;
+    int hh=ft.substring(0,2).toInt();
+    if(hh<SOLAR_SLOT_START_HOUR||hh>SOLAR_SLOT_END_HOUR) continue;
+    int si=hh-SOLAR_SLOT_START_HOUR;
+    int val=extractJsonStringValue(obj,"fcstValue").toInt();
+    for(int d=0;d<3;d++){
+      if(fd==dt[d]){
+        if(cat=="SKY")      da[d].skySlots[si]=val;
+        else if(cat=="POP") da[d].popSlots[si]=val;
+        else if(cat=="REH") da[d].rehSlots[si]=val;
+        else if(cat=="TMP") da[d].tempSlots[si]=(float)val;
+        if(!da[d].slotValid[si]){da[d].slotValid[si]=true;da[d].slotCount++;}
+      }
+    }
+  }
+}
+int extractJsonIntValue(const String&pl,const char*k){
+  String p="\""+String(k)+"\":";
+  int s=pl.indexOf(p); if(s<0)return -1;
+  s+=p.length();
+  while(s<(int)pl.length()&&(pl[s]==' '||pl[s]=='\t'||pl[s]=='\r'||pl[s]=='\n'))s++;
+  bool q=(s<(int)pl.length()&&pl[s]=='\"'); if(q)s++; int e=s;
+  while(e<(int)pl.length()){
+    char c=pl[e];
+    if(q?c=='\"':(c==','||c=='}'||c==' '||c=='\n'||c=='\r'))break;
+    e++;
+  }
+  return pl.substring(s,e).toInt();
+}
+void mergeForecastByRefreshTime(DayForecastData fd[3],DayForecastData m5[3],DayForecastData n11[3],DayForecastData ld[3]){
+  initForecastData(fd);
+  struct tm ti; int nh=9; if(getLocalTime(&ti))nh=ti.tm_hour;
+  for(int d=1;d<3;d++){
+    copyDayAllSlots(fd,ld,d);
+    for(int s=0;s<SOLAR_SLOT_COUNT;s++) if(!fd[d].slotValid[s]) copyOneSlot(fd,m5,d,s);
+  }
+  if(nh<12){copyDayAllSlots(fd,m5,0);}
+  else{
+    for(int s=0;s<SOLAR_SLOT_COUNT;s++){
+      int sh=SOLAR_SLOT_START_HOUR+s;
+      if(sh<=11)      copyOneSlot(fd,m5,0,s);
+      else if(sh<nh){ copyOneSlot(fd,n11,0,s); if(!fd[0].slotValid[s])copyOneSlot(fd,m5,0,s);}
+      else{           copyOneSlot(fd,ld,0,s);  if(!fd[0].slotValid[s])copyOneSlot(fd,n11,0,s); if(!fd[0].slotValid[s])copyOneSlot(fd,m5,0,s);}
+    }
+  }
+}
+bool fetchKmaForecastByBase(const String&bd,const String&bt,DayForecastData od[3]){
+  String dt[3]={getDateStringOffset(0),getDateStringOffset(1),getDateStringOffset(2)};
+  initForecastData(od);
+  const int rp=500,mp=8; int tc=-1; bool got=false;
+  for(int pg=1;pg<=mp;pg++){
+    String url="http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst";
+    url+="?serviceKey="+KMA_KEY+"&pageNo="+String(pg)+"&numOfRows="+String(rp);
+    url+="&dataType=JSON&base_date="+bd+"&base_time="+bt+"&nx="+String(NX)+"&ny="+String(NY);
+    HTTPClient http; http.begin(url); http.setTimeout(15000);
+    int hc=http.GET();
+    Serial.printf("KMA pg%d: %d\n",pg,hc);
+    if(hc!=200){http.end();if(pg==1)return false;break;}
+    String pl=http.getString(); http.end();
+    if(pl.indexOf("\"resultCode\":\"00\"")<0){if(pg==1)return false;break;}
+    got=true;
+    if(tc<0) tc=extractJsonIntValue(pl,"totalCount");
+    parseKmaItemsAdvancedAppend(pl,dt,od);
+    if(od[0].slotCount>=SOLAR_SLOT_COUNT&&od[1].slotCount>=SOLAR_SLOT_COUNT&&od[2].slotCount>=SOLAR_SLOT_COUNT)break;
+    if(tc>0&&pg*rp>=tc)break;
+    delay(80);
+  }
+  return got;
+}
+void fillAfterTomorrowFallback(DayForecastData fd[3]){
+  if(fd[2].slotCount>0)return;
+  int lh=getLatestKmaBaseHour();
+  int ch[]={23,20,17,14,11,8,5,2};
+  for(int i=0;i<8;i++){
+    int h=ch[i]; if(lh!=23&&h>lh)continue;
+    DayForecastData rd[3]; initForecastData(rd);
+    String rd2=getBaseDateForHour(h), rt=twoDigitBaseTime(h);
+    if(fetchKmaForecastByBase(rd2,rt,rd)&&rd[2].slotCount>0){
+      copyDayAllSlots(fd,rd,2);
+      Serial.printf("AFTER fallback OK: %s %s\n",rd2.c_str(),rt.c_str());
+      return;
+    }
+  }
+  Serial.println("AFTER fallback failed");
+}
+void fetchKmaForecast(){
+  if(WiFi.status()!=WL_CONNECTED){
+    wifiStatus="DISCONNECTED";
+    addEventLog("WiFi 연결 해제");
+    wifiDisconnectedAlert=true;
+    apiStatus="API: OFFLINE";
+    if(currentPage==PAGE_SYSTEM)drawSystemPage();
+    return;
+  }
+  struct tm ti; int nh=9; if(getLocalTime(&ti))nh=ti.tm_hour;
+  String md=getBaseDateForHour(5),mt2="0500";
+  String nd=getBaseDateForHour(11),nt="1100";
+  int lh=getLatestKmaBaseHour();
+  String ld=getBaseDateForHour(lh), lt=twoDigitBaseTime(lh);
+  apiStatus="API: CALL "+lt;
+
+  DayForecastData m5[3],n11[3],latest[3],fd[3];
+  initForecastData(m5);initForecastData(n11);initForecastData(latest);initForecastData(fd);
+  fetchKmaForecastByBase(md,mt2,m5);
+  if(nh>=12) fetchKmaForecastByBase(nd,nt,n11);
+  else       for(int d=0;d<3;d++)copyDayAllSlots(n11,m5,d);
+  if(lt==mt2&&ld==md)             for(int d=0;d<3;d++)copyDayAllSlots(latest,m5,d);
+  else if(nh>=12&&lt==nt&&ld==nd) for(int d=0;d<3;d++)copyDayAllSlots(latest,n11,d);
+  else                            fetchKmaForecastByBase(ld,lt,latest);
+  mergeForecastByRefreshTime(fd,m5,n11,latest);
+  fillAfterTomorrowFallback(fd);
+
+  float rw[3]={0,0,0};
+  for(int i=0;i<SOLAR_SLOT_COUNT;i++){
+    todayHourlyGenWh[i]=0;
+    tomorrowHourlyGenWh[i]=0;
+    afterTomorrowHourlyGenWh[i]=0;
+  }
+  for(int d=0;d<3;d++){
+    float* hourlyOut = NULL;
+    if(d==0)      hourlyOut = todayHourlyGenWh;
+    else if(d==1) hourlyOut = tomorrowHourlyGenWh;
+    else if(d==2) hourlyOut = afterTomorrowHourlyGenWh;
+
+    if(fd[d].slotCount>0)
+      rw[d]=estimateDailyWhAdvanced(
+        getDateStringOffset(d),
+        fd[d].skySlots,fd[d].popSlots,fd[d].rehSlots,fd[d].tempSlots,
+        fd[d].slotValid,fd[d].slotCount,
+        hourlyOut
+      );
+  }
+  todayGenWh=rw[0]; tomorrowGenWh=rw[1]; afterTomorrowGenWh=rw[2];
+bool any=(fd[0].slotCount>0||fd[1].slotCount>0||fd[2].slotCount>0);
+  if(any){
+  apiStatus = (fd[2].slotCount>0) ? "API: OK " + lt : "API: OK NO AFTER";
+  addEventLog(apiStatus);
+}else{
+  apiStatus = "API: NO DATA";
+  addEventLog(apiStatus);
+}
+  lastApiSync=getTimeOnlyString();
+  initialKmaFetched=true;
+  if(any){
+    updateEssModeByTomorrowForecast();
+    trafficLedMode=isEcoModeActive()?LED_MODE_ESS_ECO:LED_MODE_ESS_NORMAL;
+  } else {
+    trafficLedMode=LED_MODE_API_FAILED;
+  }
+  if(currentPage==PAGE_SYSTEM)   drawSystemPage();
+  if(currentPage==PAGE_FORECAST) drawForecastPage();
+  if(currentPage==PAGE_MAIN)     drawMainPage();
+  if(currentPage==PAGE_COMPARE)  drawComparePage();
+}
+bool isApiForecastOk(){
+  return apiStatus.startsWith("API: OK")&&(todayGenWh>0||tomorrowGenWh>0||afterTomorrowGenWh>0);
+}
+
+bool fetchKmaForecastWithRetry(uint8_t tries, unsigned long retryDelayMs){
+  for(uint8_t i=0; i<tries; i++){
+    fetchKmaForecast();
+    if(isApiForecastOk()) return true;
+
+    Serial.printf("[KMA] boot/auto retry %d/%d failed: %s\n", i+1, tries, apiStatus.c_str());
+    if(i < tries - 1){
+      apiStatus = "API: RETRY " + String(i + 2) + "/" + String(tries);
+      if(currentPage==PAGE_SYSTEM) updateSystemPageApiSync();
+      unsigned long sm = millis();
+      while(millis() - sm < retryDelayMs){
+        updateTrafficLedBlink();
+        delay(50);
+      }
+    }
+  }
+  return false;
+}
+
+// ================= API SYNC =================
+bool ensureTimeSyncedForApi(unsigned long timeoutMs){
+  configTime(9*3600,0,"kr.pool.ntp.org","pool.ntp.org","time.nist.gov");
+
+  unsigned long startMs = millis();
+  while(millis() - startMs < timeoutMs){
+    if(waitForTimeSync(3000)) return true;
+    if((millis() - startMs) > 12000UL){
+      configTime(9*3600,0,"kr.pool.ntp.org","pool.ntp.org","time.nist.gov");
+    }
+    updateTrafficLedBlink();
+    if(currentPage==PAGE_SYSTEM) updateSystemPageTimeOnly();
+    delay(200);
+  }
+  return false;
+}
+
+void doApiSyncAfterWifi(){
+  if(WiFi.status()!=WL_CONNECTED)return;
+
+  initialApiTaskRunning=true;
+  trafficLedMode=LED_MODE_TIME_SYNC;
+  trafficLedLastToggle = 0;
+  trafficLedBlinkState = false;
+  apiStatus="API: TIME SYNC";
+  if(currentPage==PAGE_SYSTEM) updateSystemPageApiSync();
+
+  bool tok=ensureTimeSyncedForApi(45000);
+  if(currentPage==PAGE_SYSTEM) updateSystemPageTimeOnly();
+  if(!tok){
+    apiStatus="API: TIME FAIL";
+    initialApiTaskRunning=false;
+    trafficLedMode=LED_MODE_API_FAILED;
+    if(currentPage==PAGE_SYSTEM) updateSystemPageApiSync();
+    return;
+  }
+
+  trafficLedMode=LED_MODE_API_LOADING;
+  apiStatus="API: CALLING";
+  startApiLedHwTimer();   
+  if(currentPage==PAGE_SYSTEM) updateSystemPageApiSync();
+  fetchKmaForecastWithRetry(3, 7000);
+  stopApiLedHwTimer();    
+  initialKmaFetched=true;
+  initialApiTaskRunning=false;
+  if(isApiForecastOk()){
+    loadActualDataFromNVS();
+    updateEssModeByTomorrowForecast();
+    trafficLedMode=isEcoModeActive()?LED_MODE_ESS_ECO:LED_MODE_ESS_NORMAL;
+    updateEssSourceLeds();
+    currentPage=PAGE_MAIN;
+    drawMainPage();
+  } else {
+    trafficLedMode=LED_MODE_API_FAILED;
+    setTrafficLeds(false,false,false);
+    if(currentPage==PAGE_SYSTEM) drawSystemPage();
+  }
+}
+
+// ================= SETUP =================
+void setup(){
+  Serial.begin(115200);
+  pinMode(TFT_CS,OUTPUT);     pinMode(TOUCH_CS,OUTPUT);
+  pinMode(LED_LOAD_PIN,OUTPUT);   pinMode(MOTOR_RELAY_PIN,OUTPUT);
+  pinMode(POWER_RELAY_PIN,OUTPUT);
+  pinMode(TRAFFIC_LED_R_PIN,OUTPUT);
+  pinMode(TRAFFIC_LED_Y_PIN,OUTPUT);
+  pinMode(TRAFFIC_LED_G_PIN,OUTPUT);
+  ledLoadOn=motorLoadOn=allLoadOn=false;
+  digitalWrite(LED_LOAD_PIN,LOW);
+  digitalWrite(MOTOR_RELAY_PIN,MOTOR_RELAY_OFF);
+  digitalWrite(POWER_RELAY_PIN,POWER_RELAY_BATTERY_ON);
+  setTrafficLeds(false,false,false);
+
+  // 저장된 ECO 전환 배터리 잔량을 부팅 시 복원한다.
+  // 저장값이 없으면 기본값 30%를 그대로 사용한다.
+  loadEcoThresholdFromNVS();
+
+  digitalWrite(TFT_CS,HIGH); digitalWrite(TOUCH_CS,HIGH);
+  SPI.begin(SPI_SCK,SPI_MISO,SPI_MOSI);
+  initINA3221();
+  tft.begin(); tft.setRotation(3);
+  ts.begin(); ts.setRotation(3);
+
+  // [부팅1] 짧은 스플래시 후 즉시 WiFi 연결 단계로 진입
+  drawBootSplashWithFastLedSequence();
+
+  // [부팅2] 시스템 페이지 초기 표시
+  currentPage=PAGE_SYSTEM;
+  wifiStatus="---"; lastApiSync="--:--"; apiStatus="API: WAIT";
+  drawSystemPage();
+  delay(50);
+
+  // [부팅3] INA3221 초기 측정
+  updateSolarPowerFromINA3221();
+  updateBatteryFromINA3221();
+  updateLoadPowerFromINA3221();
+
+  // [부팅4] WiFi 연결 (노란LED 점멸)
+  connectWiFi();
+
+  
+  // [부팅6] NTP + KMA API (WiFi 연결 시만)
+  if(WiFi.status()==WL_CONNECTED){
+    initialApiTaskStarted=true;
+    doApiSyncAfterWifi();
+  }
+  Serial.println("ESS Display UI Start");
+}
+
+// ================= WIFI MONITOR =================
+void monitorWiFiConnection(){
+  static unsigned long lastCheckMs=0;
+  if(millis()-lastCheckMs<2000UL) return;
+  lastCheckMs=millis();
+
+  bool nowConnected=(WiFi.status()==WL_CONNECTED);
+  if(nowConnected){
+    if(wifiStatus!="CONNECTED"){
+      wifiStatus="CONNECTED";
+      wifiDisconnectedAlert=false;
+      lastWifiConnectedState=true;
+      trafficLedMode=isEcoModeActive()?LED_MODE_ESS_ECO:LED_MODE_ESS_NORMAL;
+      if(currentPage==PAGE_SYSTEM) drawSystemPage();
+    }
+    return;
+  }
+
+  // 부팅 후 한 번이라도 연결되었던 WiFi가 중간에 끊긴 경우
+  if(lastWifiConnectedState && wifiStatus!="DISCONNECTED" && wifiStatus!="CONNECTING"){
+    wifiStatus="DISCONNECTED";
+    wifiDisconnectedAlert=true;
+    apiStatus="API: OFFLINE";
+    trafficLedMode=isEcoModeActive()?LED_MODE_ESS_ECO:LED_MODE_ESS_NORMAL;
+    Serial.println("[WiFi] disconnected during operation. Keep last KMA forecast and enable manual reconnect.");
+    if(currentPage==PAGE_SYSTEM) drawSystemPage();
+  }
+}
+
+// ================= LOOP =================
+void loop(){
+  if(webServerReady) server.handleClient();
+monitorWiFiConnection();
+  updateTrafficLedBlink();
+  updateEcoExternalDelay();
+  updateManualExternalDelay();
+  handleTouch();
+
+  // 1초마다 센서 갱신
+  static unsigned long lastSensorMs=0;
+  if(millis()-lastSensorMs>1000){
+    lastSensorMs=millis();
+    updateSolarPowerFromINA3221();
+    updateBatteryFromINA3221();
+    updateLoadPowerFromINA3221();
+    updateActualSolarData();
+    if(currentPage==PAGE_MAIN) updateMainDynamicValues();
+  }
+
+  // 시스템 페이지 시간 1분마다 업데이트
+  static unsigned long lastSysTimeMs=0;
+  if(currentPage==PAGE_SYSTEM && millis()-lastSysTimeMs>60000){
+    lastSysTimeMs=millis();
+    updateSystemPageTimeOnly();
+  }
+
+  // 30분마다 KMA API 재호출
+  static unsigned long lastApiMs=0;
+  if(millis()-lastApiMs>1800000UL){
+    lastApiMs=millis();
+    if(WiFi.status()==WL_CONNECTED){
+      wifiStatus="CONNECTED";
+      startApiLedHwTimer();
+      fetchKmaForecast();
+      stopApiLedHwTimer();
+      if(isApiForecastOk()){
+        updateEssModeByTomorrowForecast();
+        updateEssSourceLeds();
+      } else {
+        trafficLedMode=LED_MODE_API_FAILED;
+      }
+    } else {
+      // 오프라인 상태에서는 마지막 API 계산값으로 계속 동작하고 자동 재연결/자동 API 호출은 하지 않는다.
+      wifiStatus="DISCONNECTED";
+      wifiDisconnectedAlert=true;
+      apiStatus="API: OFFLINE";
+      if(currentPage==PAGE_SYSTEM) drawSystemPage();
+    }
+  }
+}
